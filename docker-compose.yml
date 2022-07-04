@@ -1,0 +1,37 @@
+version: '3'
+
+services:
+
+  transmission:
+    image: transmission
+    container_name: transmission-container
+      # ports:
+      #   - "9091:9091/tcp"
+      #   - "51413:51413/tcp"
+      #   - "51413:51413/udp"
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./transmission-settings.json:/transmission/config/settings.json:ro
+      - ./downloads:/transmission/downloads
+      - ./incomplete:/transmission/incomplete
+    network_mode: "service:gluetun"
+    restart: unless-stopped
+
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - 8888:8888/tcp # HTTP proxy
+      - 8388:8388/tcp # Shadowsocks
+      - 8388:8388/udp # Shadowsocks
+      ###### Transmission Ports
+      - 9091:9091
+    volumes:
+      - ./config.ovpn:/gluetun/custom.conf
+    environment:
+      - VPN_SERVICE_PROVIDER=custom
+      - VPN_TYPE=openvpn
+      - OPENVPN_CUSTOM_CONFIG=/gluetun/custom.conf
