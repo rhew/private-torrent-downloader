@@ -8,16 +8,10 @@ Three pieces for now:
 
 ## Init
 
-### Build the transmission image.
+### Make the `downloads` directory (or update `docker-compose.yaml` to point to your existing directory).
 
 ```
-docker build -t transmission .
-```
-
-### Make directories we'll use for volume mounts.
-
-```
-mkdir downloads incomplete
+mkdir downloads
 ```
 
 ## Run
@@ -35,15 +29,7 @@ source .venv/bin/activate
 docker-compose up
 ```
 
-<wait for download>
-
-### issue: download is saved to /root/Downloads in container, not volume mounted at `/transmission/downloads`.
-
-```
-docker exec -it transmission-container cp /root/Downloads/* /transmission/downloads
-```
-
-## Serve Media using DLNA.
+## Serve media using DLNA.
 
 ```
 docker run -d \

@@ -3,18 +3,14 @@ version: '3'
 services:
 
   transmission:
-    image: transmission
-    container_name: transmission-container
-      # ports:
-      #   - "9091:9091/tcp"
-      #   - "51413:51413/tcp"
-      #   - "51413:51413/udp"
-    tmpfs:
-      - /tmp
+    image: lscr.io/linuxserver/transmission
+    container_name: transmission
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
     volumes:
-      - ./transmission-settings.json:/transmission/config/settings.json:ro
-      - ./downloads:/transmission/downloads
-      - ./incomplete:/transmission/incomplete
+      - ./downloads:/downloads
     network_mode: "service:gluetun"
     restart: unless-stopped
 
