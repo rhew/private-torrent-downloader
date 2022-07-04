@@ -22,14 +22,12 @@ mkdir downloads incomplete
 
 ## Run
 
-### Select an `ovpn` file.
+### Create/update an `ovpn` file (`vpngate.ovpn`).
 
 ```
 source .venv/bin/activate
 ./vpngate.py
 ```
-
-Note the file in `/tmp`; edit `docker-compose.yaml` to use it.
 
 ### Start Transmission and GlueTun.
 

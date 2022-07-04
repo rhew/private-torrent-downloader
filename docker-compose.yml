@@ -30,7 +30,7 @@ services:
       ###### Transmission Ports
       - 9091:9091
     volumes:
-      - ./config.ovpn:/gluetun/custom.conf
+      - ./vpngate.ovpn:/gluetun/custom.conf
     environment:
       - VPN_SERVICE_PROVIDER=custom
       - VPN_TYPE=openvpn
