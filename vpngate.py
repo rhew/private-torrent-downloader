@@ -19,7 +19,8 @@ def best_vpngate_score(row1, row2):
     except:
         print('row 2 sucks: {}'.format(row2))
         return row1
-    return row1 if int(row1['Score']) > int(row2['Score']) else row2
+    # Japan servers are blocking torrent traffic
+    return row1 if int(row1['Score']) > int(row2['Score']) and row1['CountryShort'] != 'JP' else row2
 
 def get_best(rows):
     return functools.reduce(best_vpngate_score, rows)
