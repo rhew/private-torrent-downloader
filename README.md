@@ -19,8 +19,7 @@ mkdir downloads
 ### Create/update an `ovpn` file (`vpngate.ovpn`).
 
 ```
-source .venv/bin/activate
-./vpngate.py
+python3 vpngate.py
 ```
 
 ### Start Transmission and GlueTun.
