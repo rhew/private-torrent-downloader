@@ -31,3 +31,13 @@ services:
       - VPN_SERVICE_PROVIDER=custom
       - VPN_TYPE=openvpn
       - OPENVPN_CUSTOM_CONFIG=/gluetun/custom.conf
+
+  minidlna:
+    image: vladgh/minidlna
+    container_name: minidlna
+    network_mode: "host"
+    environment:
+      - MINIDLNA_MEDIA_DIR=/media
+      - MINIDLNA_FRIENDLY_NAME=miniDLNA
+    volumes:
+      - ./downloads:/media

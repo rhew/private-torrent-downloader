@@ -1,10 +1,9 @@
-# Private Torrent Downloader
+# Private Torrent Downloader and Server
 
-Three pieces for now:
+Two pieces:
 
 1. A script to select a Japanese VPN from VPN Gate
-2. A Compose file to create the VPN with GlueTun and run Transmission 
-3. A Docker line to serve media with miniDLNA
+2. A Compose file to create the VPN with GlueTun, run Transmission ,and run the miniDLNA server.
 
 ## Init
 
@@ -22,19 +21,28 @@ mkdir downloads
 python3 vpngate.py
 ```
 
-### Start Transmission and GlueTun.
+### Configure UID, GID, and download/media mount to use. Example:
 
 ```
-docker-compose up
+cat << EOF
+version: '3'
+services:
+  transmission:
+    environment:
+      - PUID=1001
+      - PGID=1001
+    volumes:
+      - /mnt/yourdevice/downloads:/downloads
+  minidlna:
+    environment:
+      - MINIDLNA_FRIENDLY_NAME=MyCoolMedia
+    volumes:
+      - /mnt/yourdevice/downloads:/media
+EOF
 ```
 
-## Serve media using DLNA.
+### Start Transmission, GlueTun and the minidlna server.
 
 ```
-docker run -d \
-  --net=host \
-  -v /home/rhew/repos/download-image/downloads:/media \
-  -e MINIDLNA_MEDIA_DIR=/media \
-  -e MINIDLNA_FRIENDLY_NAME=X1DLNA \
-  vladgh/minidlna
+docker-compose up -d
 ```
