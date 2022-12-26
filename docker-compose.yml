@@ -12,7 +12,7 @@ services:
     volumes:
       - ./downloads:/downloads
     network_mode: "service:gluetun"
-    restart: unless-stopped
+    restart: always
 
   gluetun:
     image: qmcgaw/gluetun
@@ -31,6 +31,7 @@ services:
       - VPN_SERVICE_PROVIDER=custom
       - VPN_TYPE=openvpn
       - OPENVPN_CUSTOM_CONFIG=/gluetun/custom.conf
+    restart: always
 
   minidlna:
     image: vladgh/minidlna
@@ -41,3 +42,4 @@ services:
       - MINIDLNA_FRIENDLY_NAME=miniDLNA
     volumes:
       - ./downloads:/media
+    restart: always
