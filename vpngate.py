@@ -3,6 +3,7 @@
 import base64
 import csv
 import functools
+import re
 import urllib.request
 
 VPN_CSV_URL = 'http://www.vpngate.net/api/iphone/'
@@ -49,7 +50,14 @@ def main():
 
     print('Writing configuration to temporary file.')
     with open (VPN_FILENAME, 'wb') as ovpnFile:
-        data = bytearray(base64.b64decode(best['OpenVPN_ConfigData_Base64']))
+        decoded_data = base64.b64decode(best['OpenVPN_ConfigData_Base64']).decode('utf-8')
+        updated_data = re.sub(
+            r'^cipher\s+(\S+)',
+            r'data-ciphers \1',
+            decoded_data,
+            flags=re.MULTILINE
+        )
+        data = bytearray(updated_data.encode('utf-8'))
         ovpnFile.write(data)
         print('wrote {}'.format(VPN_FILENAME))
 
