@@ -3,7 +3,7 @@ version: '3'
 services:
 
   transmission:
-    image: lscr.io/linuxserver/transmission
+    image: linuxserver/transmission:arm32v7-4.0.3
     container_name: transmission
     environment:
       - PUID=1000
