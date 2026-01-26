@@ -9,7 +9,7 @@ import urllib.request
 VPN_CSV_URL = 'http://www.vpngate.net/api/iphone/'
 VPN_FILENAME = 'vpngate.ovpn'
 
-BlockingCountries = ['JP', 'US']
+BlockingCountries = ['JP', 'US'] #, 'KR', 'RU', 'BR']
 
 def best_vpngate_score(row1, row2):
     try:
@@ -45,8 +45,8 @@ def main():
     print('Available countries: ' + str(set([row['CountryShort'] for row in csv_data])))
 
     best = get_best(csv_data)
-    print('Selected {} in {} running at {} and {} ms latency from {} choices.'.format(
-        best['#HostName'], best['CountryLong'], human_bps(int(best['Speed'])), best['Ping'], len(list(csv_data))))
+    print('Selected {} in {} ({}) running at {} and {} ms latency from {} choices.'.format(
+        best['#HostName'], best['CountryLong'], best['CountryShort'], human_bps(int(best['Speed'])), best['Ping'], len(list(csv_data))))
 
     print('Writing configuration to temporary file.')
     with open (VPN_FILENAME, 'wb') as ovpnFile:
