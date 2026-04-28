@@ -50,13 +50,7 @@ def main():
 
     print('Writing configuration to temporary file.')
     with open (VPN_FILENAME, 'wb') as ovpnFile:
-        decoded_data = base64.b64decode(best['OpenVPN_ConfigData_Base64']).decode('utf-8')
-        updated_data = re.sub(
-            r'^cipher\s+(\S+)',
-            r'data-ciphers \1',
-            decoded_data,
-            flags=re.MULTILINE
-        )
+        updated_data = base64.b64decode(best['OpenVPN_ConfigData_Base64']).decode('utf-8')
         if not re.search(
             r'^(remote-cert-tls|verify-x509-name|tls-remote|ns-cert-type)\b',
             updated_data,
