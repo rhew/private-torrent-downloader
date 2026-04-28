@@ -57,6 +57,18 @@ def main():
             decoded_data,
             flags=re.MULTILINE
         )
+        if not re.search(
+            r'^(remote-cert-tls|verify-x509-name|tls-remote|ns-cert-type)\b',
+            updated_data,
+            flags=re.MULTILINE
+        ):
+            updated_data = re.sub(
+                r'^(client\s*)$',
+                r'\1\nremote-cert-tls server',
+                updated_data,
+                count=1,
+                flags=re.MULTILINE
+            )
         data = bytearray(updated_data.encode('utf-8'))
         ovpnFile.write(data)
         print('wrote {}'.format(VPN_FILENAME))
