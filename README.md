@@ -25,7 +25,6 @@ python3 vpngate.py
 
 ```
 cat << EOF
-version: '3'
 services:
   transmission:
     environment:
