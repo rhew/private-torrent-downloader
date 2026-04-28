@@ -40,6 +40,18 @@ services:
 EOF
 ```
 
+### Disable DoT for VPN Gate and use Cloudflare DoH over 443.
+
+If VPN Gate times out with GlueTun DNS-over-TLS, add this local override:
+
+```
+services:
+  gluetun:
+    environment:
+      - DNS_UPSTREAM_RESOLVER_TYPE=doh
+      - DNS_UPSTREAM_RESOLVERS=cloudflare
+```
+
 ### Start Transmission, GlueTun and the minidlna server.
 
 ```
