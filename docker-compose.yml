@@ -29,8 +29,7 @@ services:
       - VPN_SERVICE_PROVIDER=custom
       - VPN_TYPE=openvpn
       - OPENVPN_CUSTOM_CONFIG=/gluetun/custom.conf
-      - OPENVPN_CIPHERS=AES-256-GCM,AES-128-GCM
-      - OPENVPN_EXTRA_ARGS=--data-ciphers-fallback AES-128-CBC
+      - OPENVPN_CIPHERS=AES-256-GCM,AES-128-GCM,AES-128-CBC
     restart: always
 
   minidlna:
