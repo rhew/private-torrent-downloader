@@ -40,6 +40,14 @@ services:
 EOF
 ```
 
+### Lock the Transmission image per host.
+
+The compose file defaults to `lscr.io/linuxserver/transmission`, which works for regular x86_64 hosts like an i5 server. On the Pi, create a local `.env` file next to `docker-compose.yml` to pin the 32-bit image:
+
+```
+TRANSMISSION_IMAGE=linuxserver/transmission:arm32v7-4.0.3
+```
+
 ### Disable DoT for VPN Gate and use Cloudflare DoH over 443.
 
 If VPN Gate times out with GlueTun DNS-over-TLS, add this local override:

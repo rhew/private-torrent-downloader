@@ -1,7 +1,7 @@
 services:
 
   transmission:
-    image: linuxserver/transmission:arm32v7-4.0.3
+    image: ${TRANSMISSION_IMAGE:-lscr.io/linuxserver/transmission}
     container_name: transmission
     environment:
       - PUID=1000

@@ -1,4 +1,5 @@
 .venv/
+.env
 downloads/
 vpngate.ovpn
 docker-compose.override.yml
