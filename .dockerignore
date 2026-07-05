@@ -2,6 +2,8 @@
 .venv
 __pycache__
 downloads
+library
 vpngate.ovpn
 docker-compose.override.yml
 .env
+jackett-config

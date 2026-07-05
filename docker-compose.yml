@@ -4,27 +4,25 @@ services:
     image: ${TRANSMISSION_IMAGE:-lscr.io/linuxserver/transmission}
     container_name: transmission
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/New_York
+      - PUID=${APP_UID:-1000}
+      - PGID=${APP_GID:-1000}
+      - TZ=${TZ:-America/New_York}
     volumes:
-      - ./downloads:/downloads
+      - ${DOWNLOADS_DIR:-./downloads}:/downloads
     network_mode: "service:gluetun"
     restart: always
 
-  controller:
-    build:
-      context: .
-      dockerfile: controller/Dockerfile
-    image: private-torrent-downloader-controller
-    container_name: controller
+  jackett:
+    image: lscr.io/linuxserver/jackett
+    container_name: jackett
     environment:
-      - TRANSMISSION_RPC_URL=http://127.0.0.1:9091/transmission/rpc
-      - CONTROLLER_POLL_SECONDS=60
-    network_mode: "service:gluetun"
-    depends_on:
-      - gluetun
-      - transmission
+      - PUID=${APP_UID:-1000}
+      - PGID=${APP_GID:-1000}
+      - TZ=${TZ:-America/New_York}
+    volumes:
+      - ${JACKETT_CONFIG_DIR:-./jackett-config}:/config
+    ports:
+      - 9117:9117
     restart: always
 
   gluetun:
@@ -53,7 +51,7 @@ services:
     network_mode: "host"
     environment:
       - MINIDLNA_MEDIA_DIR=/media
-      - MINIDLNA_FRIENDLY_NAME=miniDLNA
+      - MINIDLNA_FRIENDLY_NAME=${MINIDLNA_FRIENDLY_NAME:-miniDLNA}
     volumes:
-      - ./downloads:/media
+      - ${LIBRARY_DIR:-./library}:/media
     restart: always

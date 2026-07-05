@@ -1,0 +1,36 @@
+[jackett]
+base_url = "http://127.0.0.1:9117"
+transmission_base_url = "http://jackett:9117"
+config_dir = "../jackett-config/Jackett"
+
+[network]
+timeout = 20
+
+[paths]
+downloads_dir = "../downloads"
+
+[transmission]
+rpc_url = "http://127.0.0.1:9091/transmission/rpc"
+
+[state]
+file = "state.json"
+
+[ui]
+default_media_type = "movies"
+max_results = 30
+default_sort = "seeders"
+
+[media_types.movies]
+label = "Movies"
+indexers = ["yts", "limetorrents", "thepiratebay"]
+library_dir = "../library/movies"
+
+# [media_types.tv]
+# label = "TV"
+# indexers = ["your-tv-indexer"]
+# library_dir = "../library/tv"
+
+# [media_types.music]
+# label = "Music"
+# indexers = ["your-music-indexer"]
+# library_dir = "../library/music"
