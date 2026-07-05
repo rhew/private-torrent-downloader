@@ -12,6 +12,21 @@ services:
     network_mode: "service:gluetun"
     restart: always
 
+  controller:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    image: private-torrent-downloader-controller
+    container_name: controller
+    environment:
+      - TRANSMISSION_RPC_URL=http://127.0.0.1:9091/transmission/rpc
+      - CONTROLLER_POLL_SECONDS=60
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+      - transmission
+    restart: always
+
   gluetun:
     image: qmcgaw/gluetun
     container_name: gluetun

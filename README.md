@@ -1,9 +1,10 @@
 # Private Torrent Downloader and Server
 
-Two pieces:
+Three pieces:
 
 1. A script to select a Japanese VPN from VPN Gate
-2. A Compose file to create the VPN with GlueTun, run Transmission ,and run the miniDLNA server.
+2. A Compose file to create the VPN with GlueTun, run Transmission, run the controller, and run the miniDLNA server.
+3. A controller image that monitors Transmission and pauses completed torrents that are still active.
 
 ## Init
 
@@ -60,8 +61,11 @@ services:
       - DNS_UPSTREAM_RESOLVERS=cloudflare
 ```
 
-### Start Transmission, GlueTun and the minidlna server.
+### Start Transmission, GlueTun, the controller, and the minidlna server.
 
 ```
 docker-compose up -d
 ```
+
+The controller calls Transmission's RPC API every 60 seconds by default. Override
+`CONTROLLER_POLL_SECONDS` in `docker-compose.override.yml` to change the polling interval.

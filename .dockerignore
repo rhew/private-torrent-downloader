@@ -1,0 +1,7 @@
+.git
+.venv
+__pycache__
+downloads
+vpngate.ovpn
+docker-compose.override.yml
+.env
