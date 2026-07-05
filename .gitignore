@@ -7,4 +7,4 @@ docker-compose.override.yml
 __pycache__/
 jackett-config/*
 !jackett-config/.gitkeep
-curator/state.json
+curator/config.toml

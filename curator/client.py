@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import http.cookiejar
 import json
 import re
 import urllib.error
@@ -20,9 +21,10 @@ class SearchResult:
     indexer: str
     title: str
     size: str
+    size_bytes: int
     seeders: str
     leechers: str
-    category: str
+    categories: tuple[str, ...]
     guid: str
     link: str
 
@@ -39,6 +41,19 @@ class SearchResult:
     def leechers_value(self) -> int:
         return parse_int(self.leechers)
 
+    @property
+    def category(self) -> str:
+        return self.categories[0] if self.categories else "?"
+
+
+@dataclass(frozen=True)
+class JackettIndexer:
+    id: str
+    title: str
+    configured: bool
+    search_types: tuple[str, ...]
+    categories: tuple[str, ...]
+
 
 def load_api_key(config_dir: Path) -> str:
     jackett_config_file = config_dir / JACKETT_CONFIG_FILE
@@ -47,61 +62,6 @@ def load_api_key(config_dir: Path) -> str:
     if not api_key:
         raise KeyError(f"APIKey not found in {jackett_config_file}")
     return api_key
-
-
-def load_state(path: Path) -> dict:
-    if not path.exists():
-        return {"downloads": {}}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return {"downloads": data.get("downloads", {})}
-
-
-def save_state(state: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def mark_download(state: dict, result: SearchResult, torrent: dict) -> None:
-    state["downloads"][result.identity] = {
-        "indexer": result.indexer,
-        "title": result.title,
-        "size": result.size,
-        "guid": result.guid,
-        "link": result.link,
-        "torrent_id": torrent.get("id"),
-        "torrent_name": torrent.get("name"),
-        "hash_string": torrent.get("hashString"),
-        "download_dir": torrent.get("downloadDir"),
-        "status": "added",
-    }
-
-
-def update_download_progress(state: dict, torrents: list[dict]) -> None:
-    by_id = {torrent.get("id"): torrent for torrent in torrents}
-    by_hash = {
-        torrent.get("hashString"): torrent
-        for torrent in torrents
-        if torrent.get("hashString")
-    }
-    for download in state["downloads"].values():
-        torrent = None
-        torrent_id = download.get("torrent_id")
-        if torrent_id is not None:
-            torrent = by_id.get(torrent_id)
-        if torrent is None and download.get("hash_string"):
-            torrent = by_hash.get(download["hash_string"])
-        if torrent is None:
-            continue
-
-        download["torrent_id"] = torrent.get("id")
-        download["torrent_name"] = torrent.get("name")
-        download["hash_string"] = torrent.get("hashString")
-        download["download_dir"] = torrent.get("downloadDir")
-        download["percent_done"] = torrent.get("percentDone")
-        download["left_until_done"] = torrent.get("leftUntilDone")
-        download["rate_download"] = torrent.get("rateDownload")
-        download["status_code"] = torrent.get("status")
-        download["status"] = describe_torrent_status(torrent)
 
 
 def describe_torrent_status(torrent: dict) -> str:
@@ -116,13 +76,33 @@ def describe_torrent_status(torrent: dict) -> str:
     return "active"
 
 
-def build_search_url(base_url: str, api_key: str, indexer: str, query: str) -> str:
-    params = urllib.parse.urlencode({
+def build_search_url(
+    base_url: str,
+    api_key: str,
+    indexer: str,
+    query: str,
+    categories: tuple[str, ...] = (),
+) -> str:
+    params_dict = {
         "apikey": api_key,
         "t": SEARCH_MODE,
         "q": query,
-    })
+    }
+    if categories:
+        params_dict["cat"] = ",".join(categories)
+    params = urllib.parse.urlencode(params_dict)
     return f"{base_url.rstrip('/')}/api/v2.0/indexers/{indexer}/results/torznab/api?{params}"
+
+
+def build_indexers_url(base_url: str, api_key: str, configured: bool | None = None) -> str:
+    params_dict = {
+        "apikey": api_key,
+        "t": "indexers",
+    }
+    if configured is not None:
+        params_dict["configured"] = "true" if configured else "false"
+    params = urllib.parse.urlencode(params_dict)
+    return f"{base_url.rstrip('/')}/api/v2.0/indexers/all/results/torznab/api?{params}"
 
 
 def fetch_xml(url: str, timeout: float) -> bytes:
@@ -137,17 +117,27 @@ def fetch_xml(url: str, timeout: float) -> bytes:
 def search_indexer(
     query: str,
     indexer: str,
+    categories: tuple[str, ...],
     api_key: str,
     base_url: str,
     timeout: float,
 ) -> list[SearchResult]:
-    url = build_search_url(base_url, api_key, indexer, query)
-    return list(parse_items(fetch_xml(url, timeout), indexer))
+    url = build_search_url(base_url, api_key, indexer, query, categories)
+    try:
+        return list(parse_items(fetch_xml(url, timeout), indexer))
+    except urllib.error.HTTPError as error:
+        if error.code != 400 or not categories:
+            raise
+
+    fallback_url = build_search_url(base_url, api_key, indexer, query)
+    results = list(parse_items(fetch_xml(fallback_url, timeout), indexer))
+    return filter_results_by_categories(results, categories)
 
 
 def search_indexers(
     query: str,
     indexers: tuple[str, ...],
+    categories: tuple[str, ...],
     api_key: str,
     base_url: str,
     timeout: float,
@@ -156,12 +146,150 @@ def search_indexers(
     errors: dict[str, str] = {}
     for indexer in indexers:
         try:
-            results.extend(search_indexer(query, indexer, api_key, base_url, timeout))
+            results.extend(search_indexer(query, indexer, categories, api_key, base_url, timeout))
         except urllib.error.HTTPError as error:
             errors[indexer] = f"HTTP {error.code}"
         except Exception as error:
             errors[indexer] = str(error)
     return results, errors
+
+
+def fetch_indexers(
+    api_key: str,
+    base_url: str,
+    timeout: float,
+    configured: bool | None = None,
+) -> dict[str, JackettIndexer]:
+    payload = fetch_xml(build_indexers_url(base_url, api_key, configured), timeout)
+    return {
+        indexer.id: indexer
+        for indexer in parse_indexers(payload)
+    }
+
+
+def enable_indexer(
+    indexer: str,
+    base_url: str,
+    admin_password: str,
+    timeout: float,
+) -> None:
+    opener = authenticated_jackett_opener(base_url, admin_password, timeout)
+    config_url = f"{base_url.rstrip('/')}/api/v2.0/indexers/{indexer}/config"
+    config = request_json(opener, config_url, timeout=timeout)
+    payload = json.dumps(config).encode("utf-8")
+    request = urllib.request.Request(
+        config_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "private-torrent-downloader/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(summarize_jackett_http_error(error.code, details)) from error
+    if not body:
+        return
+    data = json.loads(body.decode("utf-8"))
+    if isinstance(data, dict) and data.get("result") == "error":
+        raise RuntimeError(data.get("error") or f"Jackett failed to configure {indexer}")
+
+
+def summarize_jackett_http_error(status_code: int, body: str) -> str:
+    if "UnauthorizedAccessException" in body or "Permission denied" in body:
+        return f"Jackett HTTP {status_code}: permission denied writing indexer config"
+    match = re.search(r"<title>([^<]+)</title>", body, flags=re.IGNORECASE)
+    if match:
+        return f"Jackett HTTP {status_code}: {html_to_text(match.group(1))}"
+    text = html_to_text(body).strip()
+    if text:
+        return f"Jackett HTTP {status_code}: {text[:240]}"
+    return f"Jackett HTTP {status_code}"
+
+
+def html_to_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def authenticated_jackett_opener(
+    base_url: str,
+    admin_password: str,
+    timeout: float,
+) -> urllib.request.OpenerDirector:
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+    login_url = f"{base_url.rstrip('/')}/UI/Dashboard"
+    payload = urllib.parse.urlencode({"password": admin_password}).encode("utf-8")
+    request = urllib.request.Request(
+        login_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "private-torrent-downloader/1.0",
+        },
+        method="POST",
+    )
+    opener.open(request, timeout=timeout).read()
+    return opener
+
+
+def request_json(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    timeout: float,
+):
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "private-torrent-downloader/1.0"},
+    )
+    with opener.open(request, timeout=timeout) as response:
+        payload = response.read()
+    return json.loads(payload.decode("utf-8"))
+
+
+def parse_indexers(payload: bytes) -> list[JackettIndexer]:
+    root = ET.fromstring(payload)
+    if root.tag == "error":
+        code = root.attrib.get("code", "?")
+        description = root.attrib.get("description", "unknown error")
+        raise RuntimeError(f"Jackett error {code}: {description}")
+
+    parsed: list[JackettIndexer] = []
+    for indexer in root.findall("./indexer"):
+        caps = indexer.find("caps")
+        search_types: list[str] = []
+        categories: list[str] = []
+        if caps is not None:
+            searching = caps.find("searching")
+            if searching is not None:
+                for child in list(searching):
+                    if child.attrib.get("available") == "yes":
+                        search_types.append(child.tag)
+            categories_node = caps.find("categories")
+            if categories_node is not None:
+                collect_category_ids(categories_node, categories)
+
+        parsed.append(JackettIndexer(
+            id=indexer.attrib.get("id", ""),
+            title=indexer.findtext("title", default=indexer.attrib.get("id", "")),
+            configured=indexer.attrib.get("configured") == "true",
+            search_types=tuple(search_types),
+            categories=tuple(categories),
+        ))
+    return parsed
+
+
+def collect_category_ids(node: ET.Element, categories: list[str]) -> None:
+    for child in list(node):
+        category_id = child.attrib.get("id")
+        if category_id:
+            categories.append(category_id)
+        collect_category_ids(child, categories)
 
 
 def format_size(size_bytes) -> str:
@@ -180,11 +308,18 @@ def format_size(size_bytes) -> str:
 
 def parse_items(payload: bytes, indexer: str):
     root = ET.fromstring(payload)
+    if root.tag == "error":
+        code = root.attrib.get("code", "?")
+        description = root.attrib.get("description", "unknown error")
+        raise RuntimeError(f"Jackett error {code}: {description}")
     for item in root.findall("./channel/item"):
         attrs = {}
+        category_values: list[str] = []
         for attr in item.findall("{http://torznab.com/schemas/2015/feed}attr"):
             name = attr.attrib.get("name")
             value = attr.attrib.get("value")
+            if name == "category" and value:
+                category_values.append(value)
             if name:
                 attrs[name] = value
 
@@ -192,12 +327,38 @@ def parse_items(payload: bytes, indexer: str):
             indexer=indexer,
             title=item.findtext("title", default="(untitled)"),
             size=format_size(item.findtext("size")),
+            size_bytes=parse_int(item.findtext("size")),
             seeders=attrs.get("seeders", "?"),
             leechers=attrs.get("leechers") or attrs.get("peers", "?"),
-            category=attrs.get("category", "?"),
+            categories=tuple(category_values),
             guid=item.findtext("guid", default=""),
             link=item.findtext("link", default=""),
         )
+
+
+def filter_results_by_categories(
+    results: list[SearchResult],
+    selected_categories: tuple[str, ...],
+) -> list[SearchResult]:
+    if not selected_categories:
+        return results
+    return [
+        result
+        for result in results
+        if any(category_matches(selected, actual) for selected in selected_categories for actual in result.categories)
+    ]
+
+
+def category_matches(selected: str, actual: str) -> bool:
+    try:
+        selected_value = int(selected)
+        actual_value = int(actual)
+    except (TypeError, ValueError):
+        return str(selected) == str(actual)
+
+    if selected_value % 1000 == 0:
+        return selected_value // 1000 == actual_value // 1000
+    return selected_value == actual_value
 
 
 def display_name(indexer: str) -> str:
@@ -339,6 +500,8 @@ class TransmissionClient:
                 "name",
                 "hashString",
                 "status",
+                "error",
+                "errorString",
                 "totalSize",
                 "percentDone",
                 "leftUntilDone",

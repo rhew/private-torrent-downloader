@@ -9,7 +9,6 @@ DEFAULT_BASE_URL = "http://127.0.0.1:9117"
 DEFAULT_TRANSMISSION_JACKETT_BASE_URL = "http://jackett:9117"
 DEFAULT_TRANSMISSION_RPC_URL = "http://127.0.0.1:9091/transmission/rpc"
 DEFAULT_JACKETT_CONFIG_DIR = Path("../jackett-config/Jackett")
-DEFAULT_STATE_FILE = Path("state.json")
 DEFAULT_MAX_RESULTS = 30
 DEFAULT_SORT = "seeders"
 DEFAULT_MEDIA_TYPE = "movies"
@@ -21,6 +20,7 @@ class MediaTypeConfig:
     key: str
     label: str
     indexers: tuple[str, ...]
+    categories: tuple[str, ...]
     library_dir: Path
 
 
@@ -30,14 +30,15 @@ class AppConfig:
     downloads_dir: Path
     jackett_base_url: str
     transmission_jackett_base_url: str
+    jackett_admin_password: str
     transmission_rpc_url: str
     jackett_config_dir: Path
-    state_file: Path
     timeout: float
     max_results: int
     default_sort: str
     media_type: str
     media: MediaTypeConfig
+    media_types: dict[str, MediaTypeConfig]
 
 
 def load_config(config_path: Path) -> AppConfig:
@@ -48,7 +49,6 @@ def load_config(config_path: Path) -> AppConfig:
     network = data.get("network", {})
     paths = data.get("paths", {})
     transmission = data.get("transmission", {})
-    state = data.get("state", {})
     ui = data.get("ui", {})
     media_types = data.get("media_types", {})
 
@@ -56,14 +56,21 @@ def load_config(config_path: Path) -> AppConfig:
         raise ValueError(f"No media types defined in {config_path}")
 
     selected_media_type = ui.get("default_media_type", DEFAULT_MEDIA_TYPE)
-    media_data = media_types.get(selected_media_type)
+    parsed_media_types = {
+        key: MediaTypeConfig(
+            key=key,
+            label=str(value.get("label", key.replace("_", " ").title())),
+            indexers=tuple(_parse_indexers(value.get("indexers", ()))),
+            categories=tuple(_parse_categories(value.get("categories", ()))),
+            library_dir=_resolve_path(base_dir, str(value["library_dir"])),
+        )
+        for key, value in media_types.items()
+    }
+
+    media_data = parsed_media_types.get(selected_media_type)
     if media_data is None:
         raise KeyError(f"Media type {selected_media_type!r} not found in {config_path}")
-
-    label = str(media_data.get("label", selected_media_type.replace("_", " ").title()))
-    indexers = tuple(_parse_indexers(media_data.get("indexers", ())))
     downloads_dir = _resolve_path(base_dir, str(paths.get("downloads_dir", "../downloads")))
-    library_dir = _resolve_path(base_dir, str(media_data["library_dir"]))
 
     return AppConfig(
         config_path=config_path,
@@ -72,22 +79,18 @@ def load_config(config_path: Path) -> AppConfig:
         transmission_jackett_base_url=str(
             jackett.get("transmission_base_url", DEFAULT_TRANSMISSION_JACKETT_BASE_URL)
         ),
+        jackett_admin_password=str(jackett.get("admin_password", "")),
         transmission_rpc_url=str(transmission.get("rpc_url", DEFAULT_TRANSMISSION_RPC_URL)),
         jackett_config_dir=_resolve_path(
             base_dir,
             str(jackett.get("config_dir", str(DEFAULT_JACKETT_CONFIG_DIR))),
         ),
-        state_file=_resolve_path(base_dir, str(state.get("file", str(DEFAULT_STATE_FILE)))),
         timeout=float(network.get("timeout", DEFAULT_TIMEOUT)),
         max_results=int(ui.get("max_results", DEFAULT_MAX_RESULTS)),
         default_sort=str(ui.get("default_sort", DEFAULT_SORT)),
         media_type=selected_media_type,
-        media=MediaTypeConfig(
-            key=selected_media_type,
-            label=label,
-            indexers=indexers,
-            library_dir=library_dir,
-        ),
+        media=media_data,
+        media_types=parsed_media_types,
     )
 
 
@@ -106,3 +109,11 @@ def _parse_indexers(raw_indexers) -> list[str]:
     if not indexers:
         raise ValueError("At least one indexer is required")
     return indexers
+
+
+def _parse_categories(raw_categories) -> list[str]:
+    if isinstance(raw_categories, str):
+        categories = [item.strip() for item in raw_categories.split(",") if item.strip()]
+    else:
+        categories = [str(item).strip() for item in raw_categories if str(item).strip()]
+    return categories

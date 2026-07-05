@@ -11,27 +11,34 @@ from urllib.parse import urlparse
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Input, Select, Static
 
 from .client import (
     build_torrent_add_arguments,
+    JackettIndexer,
     SearchResult,
     TransmissionClient,
+    category_matches,
     display_name,
+    enable_indexer,
+    fetch_indexers,
     format_size,
     load_api_key,
-    load_state,
-    mark_download,
-    save_state,
     search_indexers,
-    update_download_progress,
 )
 from .config import AppConfig, DEFAULT_SORT, load_config
 
 
-SORT_MODES = ("seeders", "indexer", "title")
+RESULT_COLUMNS = (
+    ("Seed", "seeders"),
+    ("Leech", "leechers"),
+    ("Size", "size"),
+    ("Indexer", "indexer"),
+    ("Title", "title"),
+)
+SORT_MODES = tuple(key for _, key in RESULT_COLUMNS)
 TORRENT_STATUS = {
     0: "paused",
     1: "check wait",
@@ -47,6 +54,7 @@ HELP_TEXT = """Keys
 / or s   focus search
 Esc      focus results
 t        focus Transmission
+[ or ]   previous/next media type
 j/k      move down/up
 g/G      first/last row
 r        refresh focused pane
@@ -55,6 +63,7 @@ Space    pause/resume selected torrent
 x        remove selected torrent and local data, with confirmation
 m        move completed torrent to library
 o        cycle result sort
+e        show last error details
 ?        show/hide help
 q        quit
 """
@@ -245,16 +254,27 @@ class CuratorApp(App):
         layout: vertical;
     }
 
-    #search {
-        dock: top;
+    #topbar {
+        height: auto;
         margin: 0 1;
     }
 
-    #alert {
+    #media-type {
+        width: 18;
+        margin-right: 1;
+    }
+
+    #search {
+        width: 1fr;
+    }
+
+    #notice {
         height: auto;
         padding: 0 1;
-        color: $text;
-        background: $error-darken-2;
+        margin: 0 1;
+        border-left: solid $primary;
+        color: $text-muted;
+        background: $surface;
     }
 
     #results-title {
@@ -264,6 +284,10 @@ class CuratorApp(App):
 
     #results {
         height: 2fr;
+    }
+
+    #results.-stale {
+        tint: $warning 15%;
     }
 
     #transmission-pane {
@@ -286,6 +310,8 @@ class CuratorApp(App):
         Binding("s", "focus_search", "Search", show=False),
         Binding("escape", "focus_results", "Results", show=False),
         Binding("t", "focus_transmission", "Transmission", show=False),
+        Binding("[", "previous_media_type", "Prev media", show=False),
+        Binding("]", "next_media_type", "Next media", show=False),
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
         Binding("g", "cursor_top", "Top", show=False),
@@ -296,6 +322,7 @@ class CuratorApp(App):
         Binding("x", "confirm_remove_torrent", "Remove", show=False),
         Binding("m", "move_completed", "Move", show=False),
         Binding("o", "cycle_sort", "Sort", show=False),
+        Binding("e", "show_error_details", "Errors", show=False),
         Binding("question_mark", "show_help", "Help"),
         Binding("q", "quit", "Quit", show=False),
     ]
@@ -304,32 +331,43 @@ class CuratorApp(App):
         super().__init__()
         self.config = config
         self.api_key = load_api_key(config.jackett_config_dir)
-        self.state = load_state(config.state_file)
+        self.media_type_keys = list(config.media_types.keys())
+        self.current_media_key = config.media_type
         self.results: list[SearchResult] = []
         self.visible_results: list[SearchResult] = []
         self.torrents: list[dict] = []
         self.query = ""
         self.sort_mode = config.default_sort if config.default_sort in SORT_MODES else DEFAULT_SORT
         self.errors: dict[str, str] = {}
+        self.jackett_indexers: dict[str, JackettIndexer] = {}
+        self.indexer_report_lines: list[str] = []
         self.message: str | None = None
-        self.alert_message: str | None = None
+        self.notice_message: str | None = None
+        self.search_in_flight = False
         self.pending_remove_torrent_id: int | None = None
         self.pending_move_torrent: dict | None = None
         self.pending_move_request: MoveRequest | None = None
 
     def compose(self) -> ComposeResult:
-        placeholder = f"Search {self.config.media.label.lower()} across configured Jackett indexers"
+        placeholder = f"Search {self.current_media().label.lower()} across configured Jackett indexers"
         yield Header()
-        yield Input(placeholder=placeholder, id="search")
-        yield Static("", id="alert")
+        with Horizontal(id="topbar"):
+            yield Select(
+                [(media.label, media.key) for media in self.config.media_types.values()],
+                value=self.current_media_key,
+                id="media-type",
+                allow_blank=False,
+            )
+            yield Input(placeholder=placeholder, id="search")
+        yield Static("", id="notice")
         yield Static("", id="results-title")
         yield DataTable(id="results")
         with Vertical(id="transmission-pane"):
             yield Static(
                 (
                     f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)} | "
-                    f"Media: {self.config.media.label} | "
-                    f"Library: {self.config.media.library_dir}"
+                    f"Media: {self.current_media().label} | "
+                    f"Library: {self.current_media().library_dir}"
                 ),
                 id="transmission-title",
             )
@@ -340,22 +378,29 @@ class CuratorApp(App):
         table = self.query_one("#results", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns("Seed", "Leech", "Size", "Indexer", "Title")
+        self.setup_results_table()
         torrents = self.query_one("#transmission", DataTable)
         torrents.cursor_type = "row"
         torrents.zebra_stripes = True
         torrents.add_columns("ID", "State", "Size", "Progress", "ETA", "DL", "Peers", "Name")
-        self.query_one("#search", Input).focus()
-        self.update_alert()
+        self.query_one("#media-type", Select).focus()
+        self.update_notice()
         self.update_title()
         self.update_transmission_title()
         self.set_interval(5, self.refresh_progress)
+        self.reconcile_indexers()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         query = event.value.strip()
         if query:
             self.query = query
             self.run_search(query)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "media-type":
+            return
+        if isinstance(event.value, str) and event.value != self.current_media_key:
+            self.switch_media_type_to(event.value)
 
     def on_data_table_row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
         self.update_title()
@@ -374,6 +419,12 @@ class CuratorApp(App):
         self.query_one("#transmission", DataTable).focus()
         self.update_title()
         self.update_transmission_title()
+
+    def action_previous_media_type(self) -> None:
+        self.switch_media_type(-1)
+
+    def action_next_media_type(self) -> None:
+        self.switch_media_type(1)
 
     def action_cursor_down(self) -> None:
         table = self.focused_table()
@@ -413,9 +464,11 @@ class CuratorApp(App):
         if not torrent:
             return
         if torrent.get("status") == 0:
-            self.control_torrent("start", torrent.get("id"))
+            self.update_status(f"Resuming {torrent.get('name') or torrent.get('id')}...")
+            self.control_torrent("start", torrent.get("id"), torrent.get("name") or "")
         else:
-            self.control_torrent("stop", torrent.get("id"))
+            self.update_status(f"Pausing {torrent.get('name') or torrent.get('id')}...")
+            self.control_torrent("stop", torrent.get("id"), torrent.get("name") or "")
 
     def action_confirm_remove_torrent(self) -> None:
         torrent = self.current_torrent()
@@ -433,7 +486,7 @@ class CuratorApp(App):
         if not confirmed:
             return
         if torrent_id is not None:
-            self.control_torrent("remove_destroy", torrent_id)
+            self.control_torrent("remove_destroy", torrent_id, "")
 
     def action_move_completed(self) -> None:
         torrent = self.current_torrent()
@@ -447,7 +500,7 @@ class CuratorApp(App):
             MoveScreen(
                 current_dir=torrent.get("downloadDir") or "",
                 current_name=torrent.get("name") or "",
-                dest_dir=str(self.config.media.library_dir),
+                dest_dir=str(self.current_media().library_dir),
                 filename=torrent.get("name") or "",
             ),
             self.handle_move_request,
@@ -496,20 +549,113 @@ class CuratorApp(App):
     def action_show_help(self) -> None:
         self.push_screen(HelpScreen())
 
+    def action_show_error_details(self) -> None:
+        details = self.error_details_text()
+        if details:
+            self.push_screen(NoticeScreen(details, copyable=True))
+
     @work(thread=True)
     def run_search(self, query: str) -> None:
+        self.call_from_thread(self.start_search, query)
+        media = self.current_media()
+        catalog = self.jackett_indexers
+        if not catalog:
+            try:
+                catalog = fetch_indexers(self.api_key, self.config.jackett_base_url, self.config.timeout)
+            except Exception as error:
+                self.call_from_thread(self.show_error, f"Jackett indexer check failed: {error}", True)
+                self.call_from_thread(self.set_results, [], {})
+                return
+            self.call_from_thread(self.set_indexer_catalog, catalog)
+
+        active_indexers, config_errors = usable_indexers(media.indexers, media.categories, catalog)
+        if not active_indexers:
+            self.call_from_thread(self.set_results, [], config_errors)
+            return
+
         self.call_from_thread(
             self.update_status,
-            f"Searching {', '.join(self.config.media.indexers)} for {query!r}...",
+            f"Searching {', '.join(active_indexers)} for {query!r}...",
         )
         results, errors = search_indexers(
             query,
-            self.config.media.indexers,
+            active_indexers,
+            media.categories,
             self.api_key,
             self.config.jackett_base_url,
             self.config.timeout,
         )
-        self.call_from_thread(self.set_results, results, errors)
+        self.call_from_thread(self.set_results, results, config_errors | errors)
+
+    @work(thread=True)
+    def reconcile_indexers(self) -> None:
+        self.call_from_thread(self.update_status, "Checking Jackett indexers...")
+        desired = desired_indexers_by_media(self.config.media_types)
+        try:
+            catalog = fetch_indexers(self.api_key, self.config.jackett_base_url, self.config.timeout)
+        except Exception as error:
+            self.call_from_thread(self.show_error, f"Jackett indexer check failed: {error}", False)
+            return
+
+        catalog, enabled, failed = self.enable_missing_indexers(tuple(desired), catalog)
+        report_lines = indexer_reconciliation_report(desired, catalog, enabled, failed)
+        failure_count = indexer_reconciliation_failure_count(desired, catalog, failed)
+        self.call_from_thread(
+            self.set_indexer_reconciliation,
+            catalog,
+            report_lines,
+            len(enabled),
+            failure_count,
+        )
+
+    def enable_missing_indexers(
+        self,
+        indexers: tuple[str, ...],
+        catalog: dict[str, JackettIndexer],
+    ) -> tuple[dict[str, JackettIndexer], list[str], dict[str, str]]:
+        missing = [
+            indexer
+            for indexer in indexers
+            if indexer in catalog and not catalog[indexer].configured
+        ]
+        if not missing:
+            return catalog, [], {}
+
+        self.call_from_thread(
+            self.update_status,
+            f"Enabling Jackett indexer(s): {', '.join(missing)}...",
+        )
+        enabled: list[str] = []
+        errors: dict[str, str] = {}
+        for indexer in missing:
+            try:
+                enable_indexer(
+                    indexer,
+                    self.config.jackett_base_url,
+                    self.config.jackett_admin_password,
+                    self.config.timeout,
+                )
+            except Exception as error:
+                errors[indexer] = str(error)
+            else:
+                enabled.append(indexer)
+
+        try:
+            catalog = fetch_indexers(self.api_key, self.config.jackett_base_url, self.config.timeout)
+        except Exception as error:
+            errors["jackett"] = f"could not refresh indexer list: {error}"
+            return catalog, enabled, errors
+
+        return catalog, enabled, errors
+
+    @work(thread=True)
+    def refresh_indexer_catalog(self) -> None:
+        try:
+            catalog = fetch_indexers(self.api_key, self.config.jackett_base_url, self.config.timeout)
+        except Exception as error:
+            self.call_from_thread(self.show_error, f"Jackett indexer check failed: {error}", False)
+            return
+        self.call_from_thread(self.set_indexer_catalog, catalog)
 
     @work(thread=True)
     def add_download(self, result: SearchResult) -> None:
@@ -537,7 +683,7 @@ class CuratorApp(App):
         self.call_from_thread(self.set_progress, torrents)
 
     @work(thread=True)
-    def control_torrent(self, action: str, torrent_id: int | None) -> None:
+    def control_torrent(self, action: str, torrent_id: int | None, torrent_name: str) -> None:
         if torrent_id is None:
             return
         client = TransmissionClient(self.config.transmission_rpc_url)
@@ -552,7 +698,7 @@ class CuratorApp(App):
         except Exception as error:
             self.call_from_thread(self.show_error, f"Transmission control failed: {error}", True)
             return
-        self.call_from_thread(self.set_progress, torrents)
+        self.call_from_thread(self.set_torrent_action_result, action, torrent_id, torrent_name, torrents)
 
     @work(thread=True)
     def move_completed_torrent(self, torrent: dict, request: MoveRequest, create_dir: bool) -> None:
@@ -595,42 +741,81 @@ class CuratorApp(App):
         )
 
     def set_results(self, results: list[SearchResult], errors: dict[str, str]) -> None:
+        self.search_in_flight = False
         self.results = results
         self.errors = errors
-        self.message = None
         if errors:
             details = ", ".join(f"{display_name(key)}={value}" for key, value in errors.items())
-            self.alert_message = f"Indexer errors: {details}"
+            self.notice_message = f"Search errors on {len(errors)} indexer(s). Press e for details."
+            self.message = f"Indexer errors: {details}"
         else:
-            self.alert_message = None
+            self.notice_message = None
+            self.message = f"Search complete: {len(results)} result(s)."
         self.render_results()
 
+    def set_indexer_catalog(self, catalog: dict[str, JackettIndexer]) -> None:
+        self.jackett_indexers = catalog
+        self.update_transmission_title()
+
+    def set_indexer_reconciliation(
+        self,
+        catalog: dict[str, JackettIndexer],
+        report_lines: list[str],
+        enabled_count: int,
+        failure_count: int,
+    ) -> None:
+        self.jackett_indexers = catalog
+        self.indexer_report_lines = report_lines
+        if failure_count:
+            self.notice_message = f"Jackett indexers: enabled {enabled_count}, failed {failure_count}. Press e for details."
+            self.message = self.notice_message
+        elif enabled_count:
+            self.message = f"Jackett indexers: enabled {enabled_count}. Press e for details."
+        else:
+            self.message = "Jackett indexers ready. Press e for details."
+        self.update_notice()
+        self.update_title()
+        self.update_transmission_title()
+
     def set_download_added(self, result: SearchResult, torrent: dict) -> None:
-        mark_download(self.state, result, torrent)
-        save_state(self.state, self.config.state_file)
-        self.alert_message = None
         self.render_results()
         name = torrent.get("name") or result.title
         self.update_status(f"Added to Transmission: {name}")
 
     def set_progress(self, torrents: list[dict]) -> None:
         self.torrents = torrents
-        update_download_progress(self.state, torrents)
-        save_state(self.state, self.config.state_file)
-        self.alert_message = None
         self.render_results()
         self.render_torrents()
-        self.update_alert()
+        self.update_notice()
+
+    def set_torrent_action_result(
+        self,
+        action: str,
+        torrent_id: int,
+        torrent_name: str,
+        torrents: list[dict],
+    ) -> None:
+        self.torrents = torrents
+        self.render_results()
+        self.render_torrents()
+        self.update_notice()
+        torrent = next((item for item in torrents if item.get("id") == torrent_id), None)
+        if action == "start":
+            if torrent and torrent.get("status") != 0:
+                self.update_status(f"Resumed: {torrent_name or torrent_id}")
+            else:
+                self.show_error(self.resume_failure_message(torrent_name or str(torrent_id), torrent), True)
+        elif action == "stop":
+            if torrent and torrent.get("status") == 0:
+                self.update_status(f"Paused: {torrent_name or torrent_id}")
+            else:
+                self.show_error(f"Transmission pause did not change state for {torrent_name or torrent_id}.", True)
 
     def finish_move_success(self, torrents: list[dict], dest_dir: str, filename: str) -> None:
         self.pending_move_torrent = None
-        self.alert_message = None
         self.torrents = torrents
-        update_download_progress(self.state, torrents)
-        save_state(self.state, self.config.state_file)
         self.render_results()
         self.render_torrents()
-        self.update_alert()
         self.update_status(
             f"Archived to {dest_dir.rstrip('/')}/{filename} and no longer tracked by Transmission."
         )
@@ -642,7 +827,8 @@ class CuratorApp(App):
     def render_results(self) -> None:
         previous = self.current_result()
         table = self.query_one("#results", DataTable)
-        table.clear()
+        table.clear(columns=True)
+        self.setup_results_table()
 
         self.visible_results = self.sorted_results()[:self.config.max_results]
         for result in self.visible_results:
@@ -658,7 +844,7 @@ class CuratorApp(App):
         if previous:
             self.restore_cursor(previous.identity)
 
-        self.update_alert()
+        self.update_notice()
         self.update_title()
         self.render_torrents()
 
@@ -698,6 +884,10 @@ class CuratorApp(App):
     def sorted_results(self) -> list[SearchResult]:
         if self.sort_mode == "seeders":
             return sorted(self.results, key=lambda result: result.seeders_value, reverse=True)
+        if self.sort_mode == "leechers":
+            return sorted(self.results, key=lambda result: result.leechers_value, reverse=True)
+        if self.sort_mode == "size":
+            return sorted(self.results, key=lambda result: result.size_bytes, reverse=True)
         if self.sort_mode == "indexer":
             return sorted(self.results, key=lambda result: (result.indexer, result.title.lower()))
         if self.sort_mode == "title":
@@ -723,6 +913,36 @@ class CuratorApp(App):
         if torrent:
             return torrent.get("id")
         return None
+
+    def current_media(self):
+        return self.config.media_types[self.current_media_key]
+
+    def switch_media_type(self, offset: int) -> None:
+        if not self.media_type_keys:
+            return
+        current_index = self.media_type_keys.index(self.current_media_key)
+        self.switch_media_type_to(self.media_type_keys[(current_index + offset) % len(self.media_type_keys)])
+
+    def switch_media_type_to(self, media_key: str) -> None:
+        if media_key not in self.config.media_types:
+            return
+        self.current_media_key = media_key
+        self.results = []
+        self.visible_results = []
+        self.errors = {}
+        self.notice_message = None
+        self.search_in_flight = False
+        self.message = f"Switched to {self.current_media().label}."
+        self.query_one("#media-type", Select).value = self.current_media_key
+        self.query_one("#search", Input).placeholder = (
+            f"Search {self.current_media().label.lower()} across configured Jackett indexers"
+        )
+        self.render_results()
+        self.update_notice()
+        self.update_title()
+        self.update_transmission_title()
+        if self.query:
+            self.run_search(self.query)
 
     def restore_cursor(self, identity: str) -> None:
         for index, result in enumerate(self.visible_results):
@@ -760,48 +980,223 @@ class CuratorApp(App):
 
     def show_error(self, message: str, modal: bool) -> None:
         self.message = message
-        self.alert_message = message
-        self.update_alert()
+        self.notice_message = message
+        self.update_notice()
         self.update_title()
         self.update_transmission_title()
         if modal:
             self.push_screen(NoticeScreen(message, copyable=True))
 
-    def clear_alert(self) -> None:
-        self.alert_message = None
-        self.update_alert()
+    def clear_notice(self) -> None:
+        self.notice_message = None
+        self.update_notice()
 
-    def update_alert(self) -> None:
-        alert = self.query_one("#alert", Static)
-        alert.update(self.alert_message or "")
+    def update_notice(self) -> None:
+        notice = self.query_one("#notice", Static)
+        notice.update(self.notice_message or "")
+
+    def error_details_text(self) -> str:
+        if self.errors:
+            return "\n".join(
+                f"{display_name(indexer)}: {message}"
+                for indexer, message in sorted(self.errors.items())
+            )
+        if self.indexer_report_lines:
+            return "\n".join(self.indexer_report_lines)
+        if self.notice_message and self.notice_message.startswith(("Search failed:", "Transmission", "Move failed:")):
+            return self.notice_message
+        return ""
 
     def update_title(self) -> None:
         title = self.query_one("#results-title", Static)
-        query = self.query or "none"
-        summary = (
-            f"Media: {self.config.media.label} | Search: {query!r} | "
-            f"Sort: {self.sort_mode} | Showing {len(self.visible_results)}/{len(self.results)}"
-        )
+        summary = ""
         if self.message:
-            summary = f"{summary} | {self.message}"
+            summary = self.message
         elif isinstance(self.focused, Input):
-            summary = f"{summary} | Enter search term and press Enter."
+            summary = "Enter search term and press Enter."
+        elif isinstance(self.focused, Select):
+            summary = "Choose media type. Enter opens the list. / focuses search."
         elif isinstance(self.focused, DataTable) and self.focused.id == "transmission":
-            summary = f"{summary} | Keys: j/k move, Space pause, m move, x remove, r refresh"
+            summary = "Keys: j/k move, Space pause, m move, x remove, r refresh, e errors"
         else:
-            summary = f"{summary} | Keys: j/k move, a add, o sort, t transmission, / search"
+            summary = "Keys: j/k move, a add, o sort, t transmission, e errors"
         title.update(summary)
 
     def update_transmission_title(self) -> None:
         title = self.query_one("#transmission-title", Static)
         summary = (
             f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)} | "
-            f"Media: {self.config.media.label} | "
-            f"Library: {self.config.media.library_dir}"
+            f"Media: {self.current_media().label} | "
+            f"Library: {self.current_media().library_dir}"
         )
         if isinstance(self.focused, DataTable) and self.focused.id == "transmission":
             summary = f"{summary} | Keys: Space pause, m move, x remove, r refresh"
         title.update(summary)
+
+    def setup_results_table(self) -> None:
+        table = self.query_one("#results", DataTable)
+        table.add_columns(*self.result_column_labels())
+        table.set_class(self.search_in_flight, "-stale")
+
+    def result_column_labels(self) -> list[str]:
+        labels: list[str] = []
+        for label, key in RESULT_COLUMNS:
+            if key == self.sort_mode:
+                labels.append(f"{label} v")
+            else:
+                labels.append(label)
+        return labels
+
+    def start_search(self, query: str) -> None:
+        self.query = query
+        self.search_in_flight = True
+        self.message = f"Searching {query!r}..."
+        self.update_title()
+        self.setup_results_table()
+
+    def resume_failure_message(self, torrent_name: str, torrent: dict | None) -> str:
+        if torrent is None:
+            return f"Transmission resume failed for {torrent_name}: torrent was not returned after refresh."
+        state = TORRENT_STATUS.get(torrent.get("status"), str(torrent.get("status")))
+        error_text = (torrent.get("errorString") or "").strip()
+        if error_text:
+            return f"Transmission resume failed for {torrent_name}: still {state}. {error_text}"
+        return (
+            f"Transmission resume failed for {torrent_name}: still {state} after refresh. "
+            "Check Transmission for queue limits or tracker errors."
+        )
+
+
+def usable_indexers(
+    indexers: tuple[str, ...],
+    categories: tuple[str, ...],
+    catalog: dict[str, JackettIndexer],
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    usable: list[str] = []
+    errors: dict[str, str] = {}
+
+    for indexer_id in indexers:
+        indexer = catalog.get(indexer_id)
+        if indexer is None:
+            errors[indexer_id] = "not found in Jackett"
+            continue
+        if not indexer.configured:
+            errors[indexer_id] = "not configured in Jackett"
+            continue
+        if not supports_media_categories(indexer, categories):
+            errors[indexer_id] = "configured, but does not advertise matching categories"
+            continue
+        usable.append(indexer_id)
+    return tuple(usable), errors
+
+
+def desired_indexers_by_media(media_types) -> dict[str, list[str]]:
+    desired: dict[str, list[str]] = {}
+    for media in media_types.values():
+        for indexer in media.indexers:
+            desired.setdefault(indexer, []).append(media.label)
+    return desired
+
+
+def indexer_reconciliation_report(
+    desired: dict[str, list[str]],
+    catalog: dict[str, JackettIndexer],
+    enabled: list[str],
+    failed: dict[str, str],
+) -> list[str]:
+    enabled_set = set(enabled)
+    failed_set = set(failed)
+    missing = [
+        indexer
+        for indexer in desired
+        if indexer not in catalog
+    ]
+    already = [
+        indexer
+        for indexer, details in catalog.items()
+        if indexer in desired and details.configured and indexer not in enabled_set
+    ]
+    still_disabled = [
+        indexer
+        for indexer, details in catalog.items()
+        if indexer in desired and not details.configured and indexer not in failed_set
+    ]
+
+    lines = ["Jackett indexer reconciliation"]
+    lines.append("")
+    append_indexer_group(lines, "Enabled", enabled, desired)
+    append_indexer_group(lines, "Already configured", sorted(already), desired)
+    append_indexer_group(lines, "Not found in Jackett", sorted(missing), desired)
+
+    if failed:
+        lines.append("Failed")
+        for indexer, message in sorted(failed.items()):
+            media = ", ".join(desired.get(indexer, ["?"]))
+            lines.append(f"- {display_name(indexer)} ({media}): {message}")
+        lines.append("")
+
+    append_indexer_group(lines, "Still disabled", sorted(still_disabled), desired)
+    return lines
+
+
+def indexer_reconciliation_failure_count(
+    desired: dict[str, list[str]],
+    catalog: dict[str, JackettIndexer],
+    failed: dict[str, str],
+) -> int:
+    count = len(failed)
+    count += sum(1 for indexer in desired if indexer not in catalog)
+    count += sum(
+        1
+        for indexer, details in catalog.items()
+        if indexer in desired and not details.configured and indexer not in failed
+    )
+    return count
+
+
+def append_indexer_group(
+    lines: list[str],
+    title: str,
+    indexers: list[str],
+    desired: dict[str, list[str]],
+) -> None:
+    if not indexers:
+        return
+    lines.append(title)
+    for indexer in indexers:
+        media = ", ".join(desired.get(indexer, ["?"]))
+        lines.append(f"- {display_name(indexer)} ({media})")
+    lines.append("")
+
+
+def supports_media_categories(indexer: JackettIndexer, categories: tuple[str, ...]) -> bool:
+    if not categories:
+        return "search" in indexer.search_types
+    if any(
+        category_matches(selected, actual)
+        for selected in categories
+        for actual in indexer.categories
+    ):
+        return True
+    search_type = search_type_for_categories(categories)
+    return search_type in indexer.search_types
+
+
+def search_type_for_categories(categories: tuple[str, ...]) -> str:
+    for category in categories:
+        try:
+            family = int(category) // 1000
+        except ValueError:
+            continue
+        if family == 2:
+            return "movie-search"
+        if family == 3:
+            return "audio-search"
+        if family == 5:
+            return "tv-search"
+        if family == 7:
+            return "book-search"
+    return "search"
 
 
 def format_percent(value) -> str:
