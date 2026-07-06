@@ -358,6 +358,7 @@ class CuratorApp(App):
         self.indexer_report_lines: list[str] = []
         self.message: str | None = None
         self.notice_message: str | None = None
+        self.notice_kind: str | None = None
         self.search_in_flight = False
         self.search_request_id = 0
         self.pending_remove_torrent_id: int | None = None
@@ -776,11 +777,10 @@ class CuratorApp(App):
         self.results = results
         self.errors = errors
         if errors:
-            details = ", ".join(f"{display_name(key)}={value}" for key, value in errors.items())
-            self.notice_message = f"Search errors on {len(errors)} indexer(s). Press e for details."
-            self.message = f"Indexer errors: {details}"
+            self.set_notice(f"Search errors on {len(errors)} indexer(s). Press e for details.", "search")
+            self.message = f"Search complete: {len(results)} result(s), {len(errors)} indexer error(s)."
         else:
-            self.notice_message = None
+            self.clear_notice("search")
             self.message = f"Search complete: {len(results)} result(s)."
         self.render_results()
 
@@ -798,11 +798,16 @@ class CuratorApp(App):
         self.jackett_indexers = catalog
         self.indexer_report_lines = report_lines
         if failure_count:
-            self.notice_message = f"Jackett indexers: enabled {enabled_count}, failed {failure_count}. Press e for details."
-            self.message = self.notice_message
+            self.set_notice(
+                f"Jackett indexers: enabled {enabled_count}, failed {failure_count}. Press e for details.",
+                "jackett",
+            )
+            self.message = "Jackett indexer check completed with errors."
         elif enabled_count:
+            self.clear_notice("jackett")
             self.message = f"Jackett indexers: enabled {enabled_count}. Press e for details."
         else:
+            self.clear_notice("jackett")
             self.message = "Jackett indexers ready. Press e for details."
         self.update_notice()
         self.update_title()
@@ -815,6 +820,7 @@ class CuratorApp(App):
 
     def set_progress(self, torrents: list[dict]) -> None:
         self.torrents = torrents
+        self.clear_notice("transmission_progress")
         self.render_results()
         self.render_torrents()
         self.update_notice()
@@ -961,6 +967,7 @@ class CuratorApp(App):
         self.visible_results = []
         self.errors = {}
         self.notice_message = None
+        self.notice_kind = None
         self.search_in_flight = False
         self.message = f"Switched to {self.current_media().label}."
         self.query_one("#media-type", Select).value = self.current_media_key
@@ -1022,16 +1029,22 @@ class CuratorApp(App):
         return Path(source_name).suffix == ""
 
     def show_error(self, message: str, modal: bool) -> None:
-        self.message = message
-        self.notice_message = message
+        self.set_notice(message, notice_kind_for_message(message))
         self.update_notice()
         self.update_title()
         self.update_transmission_title()
         if modal:
             self.push_screen(NoticeScreen(message, copyable=True))
 
-    def clear_notice(self) -> None:
+    def set_notice(self, message: str, kind: str) -> None:
+        self.notice_message = message
+        self.notice_kind = kind
+
+    def clear_notice(self, kind: str | None = None) -> None:
+        if kind is not None and self.notice_kind != kind:
+            return
         self.notice_message = None
+        self.notice_kind = None
         self.update_notice()
 
     def update_notice(self) -> None:
@@ -1046,7 +1059,7 @@ class CuratorApp(App):
             )
         if self.indexer_report_lines:
             return "\n".join(self.indexer_report_lines)
-        if self.notice_message and self.notice_message.startswith(("Search failed:", "Transmission", "Move failed:")):
+        if self.notice_message:
             return self.notice_message
         return ""
 
@@ -1428,6 +1441,20 @@ def format_peers(torrent: dict) -> str:
     if isinstance(connected, int):
         return str(connected)
     return "?"
+
+
+def notice_kind_for_message(message: str) -> str:
+    if message.startswith("Transmission progress failed:"):
+        return "transmission_progress"
+    if message.startswith("Transmission"):
+        return "transmission"
+    if message.startswith("Jackett"):
+        return "jackett"
+    if message.startswith("Search"):
+        return "search"
+    if message.startswith("Move"):
+        return "move"
+    return "general"
 
 
 def transmission_title_url(rpc_url: str) -> str:

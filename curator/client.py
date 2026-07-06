@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import html
 import http.cookiejar
 import json
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -144,14 +147,22 @@ def search_indexers(
 ) -> tuple[list[SearchResult], dict[str, str]]:
     results: list[SearchResult] = []
     errors: dict[str, str] = {}
-    for indexer in indexers:
-        try:
-            results.extend(search_indexer(query, indexer, categories, api_key, base_url, timeout))
-        except urllib.error.HTTPError as error:
-            details = error.read().decode("utf-8", errors="replace")
-            errors[indexer] = summarize_jackett_http_error(error.code, details)
-        except Exception as error:
-            errors[indexer] = str(error)
+    with ThreadPoolExecutor(max_workers=max(1, len(indexers))) as executor:
+        searches = {
+            executor.submit(search_indexer, query, indexer, categories, api_key, base_url, timeout): indexer
+            for indexer in indexers
+        }
+        for search in as_completed(searches):
+            indexer = searches[search]
+            try:
+                results.extend(search.result())
+            except urllib.error.HTTPError as error:
+                details = error.read().decode("utf-8", errors="replace")
+                errors[indexer] = summarize_jackett_http_error(error.code, details)
+            except (TimeoutError, socket.timeout):
+                errors[indexer] = f"timed out after {timeout:g}s"
+            except Exception as error:
+                errors[indexer] = str(error)
     return results, errors
 
 
@@ -207,7 +218,8 @@ def summarize_jackett_http_error(status_code: int, body: str) -> str:
         flags=re.IGNORECASE,
     )
     if xml_match:
-        return f"Jackett HTTP {status_code}: {xml_match.group(1).strip()}"
+        description = html.unescape(xml_match.group(1).strip())
+        return f"Jackett HTTP {status_code}: {summarize_jackett_description(description)}"
     if "UnauthorizedAccessException" in body or "Permission denied" in body:
         return f"Jackett HTTP {status_code}: permission denied writing indexer config"
     match = re.search(r"<title>([^<]+)</title>", body, flags=re.IGNORECASE)
@@ -217,6 +229,22 @@ def summarize_jackett_http_error(status_code: int, body: str) -> str:
     if text:
         return f"Jackett HTTP {status_code}: {text[:240]}"
     return f"Jackett HTTP {status_code}"
+
+
+def summarize_jackett_description(description: str) -> str:
+    text = re.sub(r"\s+", " ", description).strip()
+    message_match = re.search(r"Message:\s*(.+?)(?:\s+--->|\s+at\s+|$)", text)
+    if message_match:
+        return message_match.group(1).strip()
+    site_down_match = re.search(r"Request to (\S+) failed \(Error (\d+)\) - ([^.]+)", text)
+    if site_down_match:
+        url, status, reason = site_down_match.groups()
+        return f"{reason} ({url} returned {status})"
+    exception_match = re.search(r"Exception \(([^)]+)\):\s*(.+?)(?:\s+--->|\s+at\s+|$)", text)
+    if exception_match:
+        indexer, message = exception_match.groups()
+        return f"{display_name(indexer)}: {message.strip()}"
+    return text[:240]
 
 
 def html_to_text(text: str) -> str:
