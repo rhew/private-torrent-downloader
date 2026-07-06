@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 from pathlib import PurePosixPath
 from pathlib import Path
 import shutil
 import subprocess
-import re
 from urllib.parse import urlparse
 
 from textual import work
@@ -21,7 +21,6 @@ from .client import (
     JackettIndexer,
     SearchResult,
     TransmissionClient,
-    category_matches,
     display_name,
     enable_indexer,
     fetch_indexers,
@@ -30,6 +29,15 @@ from .client import (
     search_indexers,
 )
 from .config import AppConfig, DEFAULT_SORT, load_config
+from .core import (
+    MoveSuggestion,
+    desired_indexers_by_media,
+    indexer_reconciliation_failure_count,
+    indexer_reconciliation_report,
+    suggest_move_target,
+    usable_indexers,
+)
+from .remote import CuratorRemoteClient, app_config_from_remote
 
 
 RESULT_COLUMNS = (
@@ -74,13 +82,6 @@ q        quit
 class MoveRequest:
     dest_dir: str
     filename: str
-
-
-@dataclass(frozen=True)
-class MoveSuggestion:
-    dest_dir: str
-    filename: str
-    message: str
 
 
 class HelpScreen(ModalScreen):
@@ -342,10 +343,11 @@ class CuratorApp(App):
         Binding("q", "quit", "Quit", show=False),
     ]
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, remote: CuratorRemoteClient | None = None):
         super().__init__()
         self.config = config
-        self.api_key = load_api_key(config.jackett_config_dir)
+        self.remote = remote
+        self.api_key = "" if remote else load_api_key(config.jackett_config_dir)
         self.media_type_keys = list(config.media_types.keys())
         self.current_media_key = config.media_type
         self.results: list[SearchResult] = []
@@ -379,10 +381,7 @@ class CuratorApp(App):
         yield Static("", id="results-title")
         yield DataTable(id="results")
         with Vertical(id="transmission-pane"):
-            yield Static(
-                f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)}",
-                id="transmission-title",
-            )
+            yield Static("", id="transmission-title")
             yield DataTable(id="transmission")
 
     def on_mount(self) -> None:
@@ -508,12 +507,19 @@ class CuratorApp(App):
             return
         source_name = torrent.get("name") or ""
         source_dir = torrent.get("downloadDir") or ""
-        suggestion = suggest_move_target(
-            media_key=self.current_media_key,
-            library_dir=self.current_media().library_dir,
-            source_name=source_name,
-            source_is_dir=self.torrent_source_is_dir(torrent),
-        )
+        try:
+            if self.remote:
+                suggestion = self.remote.move_suggestion(self.current_media_key, torrent)
+            else:
+                suggestion = suggest_move_target(
+                    media_key=self.current_media_key,
+                    library_dir=self.current_media().library_dir,
+                    source_name=source_name,
+                    source_is_dir=self.torrent_source_is_dir(torrent),
+                )
+        except Exception as error:
+            self.show_error(f"Move suggestion failed: {error}", True)
+            return
         self.pending_move_torrent = dict(torrent)
         self.push_screen(
             MoveScreen(
@@ -538,8 +544,14 @@ class CuratorApp(App):
             self.pending_move_torrent = None
             return
 
-        dest_dir_local = self.local_dest_path(dest_dir)
-        if not dest_dir_local.exists():
+        try:
+            dest_exists = self.remote.path_exists(dest_dir) if self.remote else self.local_dest_path(dest_dir).exists()
+        except Exception as error:
+            self.show_error(f"Move failed: could not check destination directory: {error}", True)
+            self.pending_move_torrent = None
+            return
+
+        if not dest_exists:
             self.pending_move_request = request
             self.push_screen(
                 ConfirmScreen(f"Create destination directory {dest_dir}?"),
@@ -581,6 +593,16 @@ class CuratorApp(App):
 
     @work(thread=True)
     def run_search(self, query: str, media_key: str, search_id: int) -> None:
+        if self.remote:
+            try:
+                results, errors = self.remote.search(media_key, query)
+            except Exception as error:
+                self.call_from_thread(self.show_error, f"Search failed: {error}", True)
+                self.call_from_thread(self.set_results, [], {}, media_key, search_id)
+                return
+            self.call_from_thread(self.set_results, results, errors, media_key, search_id)
+            return
+
         media = self.config.media_types[media_key]
         catalog = self.jackett_indexers
         if not catalog:
@@ -614,6 +636,22 @@ class CuratorApp(App):
     @work(thread=True)
     def reconcile_indexers(self) -> None:
         self.call_from_thread(self.update_status, "Checking Jackett indexers...")
+        if self.remote:
+            try:
+                data = self.remote.reconcile_indexers()
+            except Exception as error:
+                self.call_from_thread(self.show_error, f"Jackett indexer check failed: {error}", False)
+                return
+            catalog = jackett_catalog_from_remote(data.get("catalog", {}))
+            self.call_from_thread(
+                self.set_indexer_reconciliation,
+                catalog,
+                list(data.get("report_lines", [])),
+                int(data.get("enabled_count") or 0),
+                int(data.get("failure_count") or 0),
+            )
+            return
+
         desired = desired_indexers_by_media(self.config.media_types)
         try:
             catalog = fetch_indexers(self.api_key, self.config.jackett_base_url, self.config.timeout)
@@ -674,6 +712,9 @@ class CuratorApp(App):
 
     @work(thread=True)
     def refresh_indexer_catalog(self) -> None:
+        if self.remote:
+            self.reconcile_indexers()
+            return
         try:
             catalog = fetch_indexers(self.api_key, self.config.jackett_base_url, self.config.timeout)
         except Exception as error:
@@ -685,13 +726,16 @@ class CuratorApp(App):
     def add_download(self, result: SearchResult) -> None:
         self.call_from_thread(self.update_status, f"Adding {result.title!r} to Transmission...")
         try:
-            arguments = build_torrent_add_arguments(
-                result,
-                self.config.transmission_jackett_base_url,
-                self.config.jackett_base_url,
-                self.config.timeout,
-            )
-            torrent = TransmissionClient(self.config.transmission_rpc_url).add_torrent(arguments)
+            if self.remote:
+                torrent = self.remote.add_download(result)
+            else:
+                arguments = build_torrent_add_arguments(
+                    result,
+                    self.config.transmission_jackett_base_url,
+                    self.config.jackett_base_url,
+                    self.config.timeout,
+                )
+                torrent = TransmissionClient(self.config.transmission_rpc_url).add_torrent(arguments)
         except Exception as error:
             self.call_from_thread(self.show_error, f"Transmission add failed: {error}", True)
             return
@@ -700,7 +744,7 @@ class CuratorApp(App):
     @work(thread=True)
     def refresh_progress(self) -> None:
         try:
-            torrents = TransmissionClient(self.config.transmission_rpc_url).get_torrents()
+            torrents = self.remote.torrents() if self.remote else TransmissionClient(self.config.transmission_rpc_url).get_torrents()
         except Exception as error:
             self.call_from_thread(self.show_error, f"Transmission progress failed: {error}", False)
             return
@@ -710,15 +754,18 @@ class CuratorApp(App):
     def control_torrent(self, action: str, torrent_id: int | None, torrent_name: str) -> None:
         if torrent_id is None:
             return
-        client = TransmissionClient(self.config.transmission_rpc_url)
         try:
-            if action == "start":
-                client.start_torrents([torrent_id])
-            elif action == "stop":
-                client.stop_torrents([torrent_id])
-            elif action == "remove_destroy":
-                client.remove_torrents([torrent_id], delete_local_data=True)
-            torrents = client.get_torrents()
+            if self.remote:
+                torrents = self.remote.control_torrent(action, torrent_id)
+            else:
+                client = TransmissionClient(self.config.transmission_rpc_url)
+                if action == "start":
+                    client.start_torrents([torrent_id])
+                elif action == "stop":
+                    client.stop_torrents([torrent_id])
+                elif action == "remove_destroy":
+                    client.remove_torrents([torrent_id], delete_local_data=True)
+                torrents = client.get_torrents()
         except Exception as error:
             self.call_from_thread(self.show_error, f"Transmission control failed: {error}", True)
             return
@@ -727,32 +774,40 @@ class CuratorApp(App):
     @work(thread=True)
     def move_completed_torrent(self, torrent: dict, request: MoveRequest, create_dir: bool) -> None:
         try:
-            source_dir = torrent.get("downloadDir") or ""
-            source_name = torrent.get("name") or ""
-            if not source_dir or not source_name:
-                raise RuntimeError("missing torrent source path")
+            if self.remote:
+                data = self.remote.move_completed_torrent(torrent, request.dest_dir, request.filename, create_dir)
+                torrents = list(data.get("torrents", []))
+                dest_dir = str(data.get("dest_dir") or request.dest_dir)
+                filename = str(data.get("filename") or request.filename)
+            else:
+                source_dir = torrent.get("downloadDir") or ""
+                source_name = torrent.get("name") or ""
+                if not source_dir or not source_name:
+                    raise RuntimeError("missing torrent source path")
 
-            source_local = self.transmission_path_to_local(source_dir) / source_name
-            dest_dir_local = self.local_dest_path(request.dest_dir)
-            dest_local = dest_dir_local / request.filename
+                source_local = self.transmission_path_to_local(source_dir) / source_name
+                dest_dir_local = self.local_dest_path(request.dest_dir)
+                dest_local = dest_dir_local / request.filename
 
-            if create_dir:
-                dest_dir_local.mkdir(parents=True, exist_ok=True)
-            elif not dest_dir_local.exists():
-                raise FileNotFoundError(f"destination directory does not exist: {request.dest_dir}")
+                if create_dir:
+                    dest_dir_local.mkdir(parents=True, exist_ok=True)
+                elif not dest_dir_local.exists():
+                    raise FileNotFoundError(f"destination directory does not exist: {request.dest_dir}")
 
-            if not source_local.exists():
-                raise FileNotFoundError(f"source path does not exist: {source_local}")
-            if source_local == dest_local:
-                raise RuntimeError("source and destination are the same")
-            if dest_local.exists():
-                raise FileExistsError(f"destination already exists: {dest_local}")
+                if not source_local.exists():
+                    raise FileNotFoundError(f"source path does not exist: {source_local}")
+                if source_local == dest_local:
+                    raise RuntimeError("source and destination are the same")
+                if dest_local.exists():
+                    raise FileExistsError(f"destination already exists: {dest_local}")
 
-            shutil.move(str(source_local), str(dest_local))
+                shutil.move(str(source_local), str(dest_local))
 
-            client = TransmissionClient(self.config.transmission_rpc_url)
-            client.remove_torrents([torrent.get("id")], delete_local_data=False)
-            torrents = client.get_torrents()
+                client = TransmissionClient(self.config.transmission_rpc_url)
+                client.remove_torrents([torrent.get("id")], delete_local_data=False)
+                torrents = client.get_torrents()
+                dest_dir = request.dest_dir
+                filename = request.filename
         except Exception as error:
             self.call_from_thread(self.finish_move_error, error)
             return
@@ -760,8 +815,8 @@ class CuratorApp(App):
         self.call_from_thread(
             self.finish_move_success,
             torrents,
-            request.dest_dir,
-            request.filename,
+            dest_dir,
+            filename,
         )
 
     def set_results(
@@ -1080,9 +1135,10 @@ class CuratorApp(App):
 
     def update_transmission_title(self) -> None:
         title = self.query_one("#transmission-title", Static)
-        summary = (
-            f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)}"
-        )
+        if self.remote:
+            summary = f"Transmission via Curator: {self.remote.base_url}"
+        else:
+            summary = f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)}"
         if isinstance(self.focused, DataTable) and self.focused.id == "transmission":
             summary = f"{summary} | Keys: Space pause, m move, x remove, r refresh"
         title.update(summary)
@@ -1122,284 +1178,17 @@ class CuratorApp(App):
         )
 
 
-def usable_indexers(
-    indexers: tuple[str, ...],
-    categories: tuple[str, ...],
-    catalog: dict[str, JackettIndexer],
-) -> tuple[tuple[str, ...], dict[str, str]]:
-    usable: list[str] = []
-    errors: dict[str, str] = {}
-
-    for indexer_id in indexers:
-        indexer = catalog.get(indexer_id)
-        if indexer is None:
-            errors[indexer_id] = "not found in Jackett"
-            continue
-        if not indexer.configured:
-            errors[indexer_id] = "not configured in Jackett"
-            continue
-        if not supports_media_categories(indexer, categories):
-            errors[indexer_id] = "configured, but does not advertise matching categories"
-            continue
-        usable.append(indexer_id)
-    return tuple(usable), errors
-
-
-def desired_indexers_by_media(media_types) -> dict[str, list[str]]:
-    desired: dict[str, list[str]] = {}
-    for media in media_types.values():
-        for indexer in media.indexers:
-            desired.setdefault(indexer, []).append(media.label)
-    return desired
-
-
-def indexer_reconciliation_report(
-    desired: dict[str, list[str]],
-    catalog: dict[str, JackettIndexer],
-    enabled: list[str],
-    failed: dict[str, str],
-) -> list[str]:
-    enabled_set = set(enabled)
-    failed_set = set(failed)
-    missing = [
-        indexer
-        for indexer in desired
-        if indexer not in catalog
-    ]
-    already = [
-        indexer
-        for indexer, details in catalog.items()
-        if indexer in desired and details.configured and indexer not in enabled_set
-    ]
-    still_disabled = [
-        indexer
-        for indexer, details in catalog.items()
-        if indexer in desired and not details.configured and indexer not in failed_set
-    ]
-
-    lines = ["Jackett indexer reconciliation"]
-    lines.append("")
-    append_indexer_group(lines, "Enabled", enabled, desired)
-    append_indexer_group(lines, "Already configured", sorted(already), desired)
-    append_indexer_group(lines, "Not found in Jackett", sorted(missing), desired)
-
-    if failed:
-        lines.append("Failed")
-        for indexer, message in sorted(failed.items()):
-            media = ", ".join(desired.get(indexer, ["?"]))
-            lines.append(f"- {display_name(indexer)} ({media}): {message}")
-        lines.append("")
-
-    append_indexer_group(lines, "Still disabled", sorted(still_disabled), desired)
-    return lines
-
-
-def indexer_reconciliation_failure_count(
-    desired: dict[str, list[str]],
-    catalog: dict[str, JackettIndexer],
-    failed: dict[str, str],
-) -> int:
-    count = len(failed)
-    count += sum(1 for indexer in desired if indexer not in catalog)
-    count += sum(
-        1
-        for indexer, details in catalog.items()
-        if indexer in desired and not details.configured and indexer not in failed
-    )
-    return count
-
-
-def append_indexer_group(
-    lines: list[str],
-    title: str,
-    indexers: list[str],
-    desired: dict[str, list[str]],
-) -> None:
-    if not indexers:
-        return
-    lines.append(title)
-    for indexer in indexers:
-        media = ", ".join(desired.get(indexer, ["?"]))
-        lines.append(f"- {display_name(indexer)} ({media})")
-    lines.append("")
-
-
-def supports_media_categories(indexer: JackettIndexer, categories: tuple[str, ...]) -> bool:
-    if not categories:
-        return "search" in indexer.search_types
-    if any(
-        category_matches(selected, actual)
-        for selected in categories
-        for actual in indexer.categories
-    ):
-        return True
-    search_type = search_type_for_categories(categories)
-    return search_type in indexer.search_types
-
-
-def search_type_for_categories(categories: tuple[str, ...]) -> str:
-    for category in categories:
-        try:
-            family = int(category) // 1000
-        except ValueError:
-            continue
-        if family == 2:
-            return "movie-search"
-        if family == 3:
-            return "audio-search"
-        if family == 5:
-            return "tv-search"
-        if family == 7:
-            return "book-search"
-    return "search"
-
-
-def suggest_move_target(
-    media_key: str,
-    library_dir: Path,
-    source_name: str,
-    source_is_dir: bool,
-) -> MoveSuggestion:
-    fallback = MoveSuggestion(
-        dest_dir=str(library_dir),
-        filename=source_name,
-        message="Automatic naming: could not identify this item. Using the current name.",
-    )
-    if not source_name:
-        return fallback
-
-    normalized_media = media_key.lower()
-    is_movie_media = normalized_media in {"movies", "movie"} or normalized_media.startswith("movie")
-    is_show_media = normalized_media in {"shows", "show", "tv"} or normalized_media.startswith("show")
-    if not is_movie_media and not is_show_media:
-        return MoveSuggestion(
-            dest_dir=str(library_dir),
-            filename=source_name,
-            message=f"Automatic naming: no supported rule for media type {media_key!r}. Using the current name.",
+def jackett_catalog_from_remote(data: dict) -> dict[str, JackettIndexer]:
+    return {
+        str(key): JackettIndexer(
+            id=str(value["id"]),
+            title=str(value["title"]),
+            configured=bool(value.get("configured")),
+            categories=tuple(str(item) for item in value.get("categories", ())),
+            search_types=tuple(str(item) for item in value.get("search_types", ())),
         )
-
-    try:
-        from guessit import guessit
-    except ImportError:
-        return MoveSuggestion(
-            dest_dir=str(library_dir),
-            filename=source_name,
-            message="Automatic naming unavailable: install dependencies from requirements.txt.",
-        )
-
-    try:
-        info = dict(guessit(source_name))
-    except Exception as error:
-        return MoveSuggestion(
-            dest_dir=str(library_dir),
-            filename=source_name,
-            message=f"Automatic naming failed: GuessIt could not parse this item ({error}).",
-        )
-
-    if is_movie_media:
-        return suggest_movie_target(library_dir, source_name, source_is_dir, info)
-    if is_show_media:
-        return suggest_episode_target(library_dir, source_name, source_is_dir, info)
-
-    return MoveSuggestion(
-        dest_dir=str(library_dir),
-        filename=source_name,
-        message=f"Automatic naming: no supported rule for media type {media_key!r}. Using the current name.",
-    )
-
-
-def suggest_movie_target(
-    library_dir: Path,
-    source_name: str,
-    source_is_dir: bool,
-    info: dict,
-) -> MoveSuggestion:
-    title = clean_path_component(scalar_text(info.get("title")))
-    if not title:
-        return MoveSuggestion(
-            dest_dir=str(library_dir),
-            filename=source_name,
-            message="Automatic naming: GuessIt did not find a movie title. Using the current name.",
-        )
-
-    year = scalar_text(info.get("year"))
-    movie_name = f"{title} ({year})" if year else title
-    message = "Automatic naming: suggested movie title/year from GuessIt."
-    if not year:
-        message = "Automatic naming: found a movie title, but no year. Review before moving."
-
-    if source_is_dir:
-        return MoveSuggestion(
-            dest_dir=str(library_dir),
-            filename=movie_name,
-            message=message,
-        )
-
-    extension = Path(source_name).suffix
-    return MoveSuggestion(
-        dest_dir=str(library_dir / movie_name),
-        filename=f"{movie_name}{extension}",
-        message=message,
-    )
-
-
-def suggest_episode_target(
-    library_dir: Path,
-    source_name: str,
-    source_is_dir: bool,
-    info: dict,
-) -> MoveSuggestion:
-    if source_is_dir:
-        return MoveSuggestion(
-            dest_dir=str(library_dir),
-            filename=source_name,
-            message="Automatic naming: episode renaming is only supported for single files.",
-        )
-
-    show = clean_path_component(scalar_text(info.get("title")))
-    season = scalar_int(info.get("season"))
-    episode = scalar_int(info.get("episode"))
-    if not show or season is None or episode is None:
-        return MoveSuggestion(
-            dest_dir=str(library_dir),
-            filename=source_name,
-            message="Automatic naming: GuessIt could not find show, season, and episode.",
-        )
-
-    episode_title = clean_path_component(scalar_text(info.get("episode_title")))
-    season_dir = f"Season {season:02d}"
-    episode_name = f"{show} - S{season:02d}E{episode:02d}"
-    if episode_title:
-        episode_name = f"{episode_name} - {episode_title}"
-    extension = Path(source_name).suffix
-    return MoveSuggestion(
-        dest_dir=str(library_dir / show / season_dir),
-        filename=f"{episode_name}{extension}",
-        message="Automatic naming: suggested episode path from GuessIt.",
-    )
-
-
-def scalar_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        value = value[0] if value else ""
-    return str(value).strip()
-
-
-def scalar_int(value) -> int | None:
-    if isinstance(value, (list, tuple)):
-        value = value[0] if value else None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def clean_path_component(value: str) -> str:
-    cleaned = re.sub(r'[<>:"/\\|?*]+', " ", value)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
-    return cleaned
+        for key, value in data.items()
+    }
 
 
 def format_percent(value) -> str:
@@ -1479,12 +1268,20 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=Path("curator/config.toml"),
-        help="TOML config path (default: curator/config.toml)",
+        help="TOML config path for local mode (default: curator/config.toml)",
     )
+    parser.add_argument("--server-url", help="Curator server URL, for example http://lenny:8787")
+    parser.add_argument("--token", default=os.environ.get("CURATOR_TOKEN", ""), help="Bearer token for Curator server")
+    parser.add_argument("--remote-timeout", type=float, default=30.0, help="Remote server request timeout")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
-    CuratorApp(config).run()
+    if args.server_url:
+        remote = CuratorRemoteClient(args.server_url, args.token, args.remote_timeout)
+        config = app_config_from_remote(remote.config(), args.server_url)
+        CuratorApp(config, remote).run()
+    else:
+        config = load_config(args.config)
+        CuratorApp(config).run()

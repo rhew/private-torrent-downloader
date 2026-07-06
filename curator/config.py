@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import tomllib
 
@@ -74,16 +75,29 @@ def load_config(config_path: Path) -> AppConfig:
 
     return AppConfig(
         config_path=config_path,
-        downloads_dir=downloads_dir,
-        jackett_base_url=str(jackett.get("base_url", DEFAULT_BASE_URL)),
-        transmission_jackett_base_url=str(
-            jackett.get("transmission_base_url", DEFAULT_TRANSMISSION_JACKETT_BASE_URL)
+        downloads_dir=_resolve_path(
+            base_dir,
+            os.environ.get("CURATOR_DOWNLOADS_DIR", str(downloads_dir)),
+        ),
+        jackett_base_url=os.environ.get(
+            "CURATOR_JACKETT_BASE_URL",
+            str(jackett.get("base_url", DEFAULT_BASE_URL)),
+        ),
+        transmission_jackett_base_url=os.environ.get(
+            "CURATOR_TRANSMISSION_JACKETT_BASE_URL",
+            str(jackett.get("transmission_base_url", DEFAULT_TRANSMISSION_JACKETT_BASE_URL)),
         ),
         jackett_admin_password=str(jackett.get("admin_password", "")),
-        transmission_rpc_url=str(transmission.get("rpc_url", DEFAULT_TRANSMISSION_RPC_URL)),
+        transmission_rpc_url=os.environ.get(
+            "CURATOR_TRANSMISSION_RPC_URL",
+            str(transmission.get("rpc_url", DEFAULT_TRANSMISSION_RPC_URL)),
+        ),
         jackett_config_dir=_resolve_path(
             base_dir,
-            str(jackett.get("config_dir", str(DEFAULT_JACKETT_CONFIG_DIR))),
+            os.environ.get(
+                "CURATOR_JACKETT_CONFIG_DIR",
+                str(jackett.get("config_dir", str(DEFAULT_JACKETT_CONFIG_DIR))),
+            ),
         ),
         timeout=float(network.get("timeout", DEFAULT_TIMEOUT)),
         max_results=int(ui.get("max_results", DEFAULT_MAX_RESULTS)),

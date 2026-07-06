@@ -4,7 +4,7 @@ Three pieces:
 
 1. A script to select a VPN from VPN Gate
 2. A Compose file to create the VPN with GlueTun, run Transmission, run Jackett, and run the miniDLNA server.
-3. A `curator` TUI that reads Jackett's generated API key, queries configured indexers, and sends selected results to Transmission.
+3. A `curator` TUI and optional Curator server. The server owns Jackett, Transmission, and filesystem operations; the TUI can run locally against that server from another machine.
 
 ## Init
 
@@ -100,18 +100,47 @@ Archive, so those are not in the shipped config.
 python3 vpngate.py
 ```
 
-### Start Transmission, GlueTun, Jackett, and the minidlna server.
+### Start Transmission, GlueTun, Jackett, Curator server, and the miniDLNA server.
 
 ```
 docker-compose up -d
 ```
 
-### Start the Curator TUI
+### Start the Curator TUI locally on the same host
 
 ```bash
 python3 -m pip install -r requirements.txt
 python3 -m curator
 ```
+
+### Start the Curator TUI as a client from another host
+
+Run the server in Docker on the machine that owns the downloads, library, Jackett config, and Transmission instance:
+
+```bash
+docker compose up -d curator-server
+```
+
+Then run the TUI from your laptop:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m curator --server-url http://lenny:8787
+```
+
+If `CURATOR_TOKEN` is set in the server `.env`, pass the same token to the client:
+
+```bash
+CURATOR_TOKEN='replace-me' python3 -m curator --server-url http://lenny:8787
+```
+
+In server mode the TUI does not need local access to Jackett config, Transmission, downloads, or the library. It only talks to the Curator HTTP API. The server reads `curator/config.toml`, reconciles configured Jackett indexers, searches, adds downloads, controls Transmission, and moves completed downloads into the configured library directories.
+
+The Docker service overrides network URLs for container-to-container access:
+
+- `CURATOR_JACKETT_BASE_URL=http://jackett:9117`
+- `CURATOR_TRANSMISSION_JACKETT_BASE_URL=http://jackett:9117`
+- `CURATOR_TRANSMISSION_RPC_URL=http://gluetun:9091/transmission/rpc`
 
 ## Problems
 
