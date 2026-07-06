@@ -148,7 +148,8 @@ def search_indexers(
         try:
             results.extend(search_indexer(query, indexer, categories, api_key, base_url, timeout))
         except urllib.error.HTTPError as error:
-            errors[indexer] = f"HTTP {error.code}"
+            details = error.read().decode("utf-8", errors="replace")
+            errors[indexer] = summarize_jackett_http_error(error.code, details)
         except Exception as error:
             errors[indexer] = str(error)
     return results, errors
@@ -200,6 +201,13 @@ def enable_indexer(
 
 
 def summarize_jackett_http_error(status_code: int, body: str) -> str:
+    xml_match = re.search(
+        r"<error[^>]*description=\"([^\"]+)\"",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if xml_match:
+        return f"Jackett HTTP {status_code}: {xml_match.group(1).strip()}"
     if "UnauthorizedAccessException" in body or "Permission denied" in body:
         return f"Jackett HTTP {status_code}: permission denied writing indexer config"
     match = re.search(r"<title>([^<]+)</title>", body, flags=re.IGNORECASE)

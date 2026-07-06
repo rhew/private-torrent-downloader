@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 from pathlib import Path
 import shutil
 import subprocess
+import re
 from urllib.parse import urlparse
 
 from textual import work
@@ -13,7 +14,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Select, Static
+from textual.widgets import DataTable, Input, Select, Static
 
 from .client import (
     build_torrent_add_arguments,
@@ -73,6 +74,13 @@ q        quit
 class MoveRequest:
     dest_dir: str
     filename: str
+
+
+@dataclass(frozen=True)
+class MoveSuggestion:
+    dest_dir: str
+    filename: str
+    message: str
 
 
 class HelpScreen(ModalScreen):
@@ -207,22 +215,27 @@ class MoveScreen(ModalScreen[MoveRequest | None]):
         Binding("q", "cancel", "Cancel", show=False),
     ]
 
-    def __init__(self, current_dir: str, current_name: str, dest_dir: str, filename: str):
+    def __init__(
+        self,
+        current_dir: str,
+        current_name: str,
+        suggestion: MoveSuggestion,
+    ):
         super().__init__()
         self.current_dir = current_dir
         self.current_name = current_name
-        self.dest_dir = dest_dir
-        self.filename = filename
+        self.suggestion = suggestion
 
     def compose(self) -> ComposeResult:
         with Vertical(id="move-dialog"):
             yield Static("Archive completed torrent to a new location and stop tracking it in Transmission.")
             yield Static(f"Current dir: {self.current_dir}")
             yield Static(f"Current name: {self.current_name}")
+            yield Static(self.suggestion.message)
             yield Static("Destination dir", classes="move-label")
-            yield Input(self.dest_dir, id="move-dest-dir")
+            yield Input(self.suggestion.dest_dir, id="move-dest-dir")
             yield Static("Final name", classes="move-label")
-            yield Input(self.filename, id="move-filename")
+            yield Input(self.suggestion.filename, id="move-filename")
             yield Static("Enter to move. Tab switches fields. Esc cancels.")
 
     def on_mount(self) -> None:
@@ -284,6 +297,7 @@ class CuratorApp(App):
 
     #results {
         height: 2fr;
+        min-height: 8;
     }
 
     #results.-stale {
@@ -293,6 +307,7 @@ class CuratorApp(App):
     #transmission-pane {
         height: 1fr;
         border-top: solid $primary;
+        min-height: 8;
     }
 
     #transmission-title {
@@ -344,13 +359,13 @@ class CuratorApp(App):
         self.message: str | None = None
         self.notice_message: str | None = None
         self.search_in_flight = False
+        self.search_request_id = 0
         self.pending_remove_torrent_id: int | None = None
         self.pending_move_torrent: dict | None = None
         self.pending_move_request: MoveRequest | None = None
 
     def compose(self) -> ComposeResult:
         placeholder = f"Search {self.current_media().label.lower()} across configured Jackett indexers"
-        yield Header()
         with Horizontal(id="topbar"):
             yield Select(
                 [(media.label, media.key) for media in self.config.media_types.values()],
@@ -364,15 +379,10 @@ class CuratorApp(App):
         yield DataTable(id="results")
         with Vertical(id="transmission-pane"):
             yield Static(
-                (
-                    f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)} | "
-                    f"Media: {self.current_media().label} | "
-                    f"Library: {self.current_media().library_dir}"
-                ),
+                f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)}",
                 id="transmission-title",
             )
             yield DataTable(id="transmission")
-        yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#results", DataTable)
@@ -382,7 +392,7 @@ class CuratorApp(App):
         torrents = self.query_one("#transmission", DataTable)
         torrents.cursor_type = "row"
         torrents.zebra_stripes = True
-        torrents.add_columns("ID", "State", "Size", "Progress", "ETA", "DL", "Peers", "Name")
+        torrents.add_columns("State", "Size", "Progress", "ETA", "DL", "Peers", "Name")
         self.query_one("#media-type", Select).focus()
         self.update_notice()
         self.update_title()
@@ -394,7 +404,7 @@ class CuratorApp(App):
         query = event.value.strip()
         if query:
             self.query = query
-            self.run_search(query)
+            self.dispatch_search(query)
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "media-type":
@@ -452,7 +462,7 @@ class CuratorApp(App):
         if self.focused_table().id == "transmission":
             self.refresh_progress()
         elif self.query:
-            self.run_search(self.query)
+            self.dispatch_search(self.query)
 
     def action_add_download(self) -> None:
         result = self.current_result()
@@ -495,13 +505,20 @@ class CuratorApp(App):
         if torrent.get("leftUntilDone") != 0 and torrent.get("percentDone") != 1:
             self.push_screen(NoticeScreen("Move skipped: selected torrent is not complete."))
             return
+        source_name = torrent.get("name") or ""
+        source_dir = torrent.get("downloadDir") or ""
+        suggestion = suggest_move_target(
+            media_key=self.current_media_key,
+            library_dir=self.current_media().library_dir,
+            source_name=source_name,
+            source_is_dir=self.torrent_source_is_dir(torrent),
+        )
         self.pending_move_torrent = dict(torrent)
         self.push_screen(
             MoveScreen(
-                current_dir=torrent.get("downloadDir") or "",
-                current_name=torrent.get("name") or "",
-                dest_dir=str(self.current_media().library_dir),
-                filename=torrent.get("name") or "",
+                current_dir=source_dir,
+                current_name=source_name,
+                suggestion=suggestion,
             ),
             self.handle_move_request,
         )
@@ -554,28 +571,34 @@ class CuratorApp(App):
         if details:
             self.push_screen(NoticeScreen(details, copyable=True))
 
+    def dispatch_search(self, query: str) -> None:
+        self.search_request_id += 1
+        search_id = self.search_request_id
+        media_key = self.current_media_key
+        self.start_search(query, media_key)
+        self.run_search(query, media_key, search_id)
+
     @work(thread=True)
-    def run_search(self, query: str) -> None:
-        self.call_from_thread(self.start_search, query)
-        media = self.current_media()
+    def run_search(self, query: str, media_key: str, search_id: int) -> None:
+        media = self.config.media_types[media_key]
         catalog = self.jackett_indexers
         if not catalog:
             try:
                 catalog = fetch_indexers(self.api_key, self.config.jackett_base_url, self.config.timeout)
             except Exception as error:
                 self.call_from_thread(self.show_error, f"Jackett indexer check failed: {error}", True)
-                self.call_from_thread(self.set_results, [], {})
+                self.call_from_thread(self.set_results, [], {}, media_key, search_id)
                 return
             self.call_from_thread(self.set_indexer_catalog, catalog)
 
         active_indexers, config_errors = usable_indexers(media.indexers, media.categories, catalog)
         if not active_indexers:
-            self.call_from_thread(self.set_results, [], config_errors)
+            self.call_from_thread(self.set_results, [], config_errors, media_key, search_id)
             return
 
         self.call_from_thread(
             self.update_status,
-            f"Searching {', '.join(active_indexers)} for {query!r}...",
+            f"Searching {media.label}: {query!r}...",
         )
         results, errors = search_indexers(
             query,
@@ -585,7 +608,7 @@ class CuratorApp(App):
             self.config.jackett_base_url,
             self.config.timeout,
         )
-        self.call_from_thread(self.set_results, results, config_errors | errors)
+        self.call_from_thread(self.set_results, results, config_errors | errors, media_key, search_id)
 
     @work(thread=True)
     def reconcile_indexers(self) -> None:
@@ -740,7 +763,15 @@ class CuratorApp(App):
             request.filename,
         )
 
-    def set_results(self, results: list[SearchResult], errors: dict[str, str]) -> None:
+    def set_results(
+        self,
+        results: list[SearchResult],
+        errors: dict[str, str],
+        media_key: str,
+        search_id: int,
+    ) -> None:
+        if search_id != self.search_request_id or media_key != self.current_media_key:
+            return
         self.search_in_flight = False
         self.results = results
         self.errors = errors
@@ -830,7 +861,7 @@ class CuratorApp(App):
         table.clear(columns=True)
         self.setup_results_table()
 
-        self.visible_results = self.sorted_results()[:self.config.max_results]
+        self.visible_results = self.sorted_results()
         for result in self.visible_results:
             table.add_row(
                 str(result.seeders),
@@ -856,13 +887,12 @@ class CuratorApp(App):
         for torrent in self.sorted_torrents():
             torrent_id = torrent.get("id")
             table.add_row(
-                str(torrent_id or ""),
                 TORRENT_STATUS.get(torrent.get("status"), str(torrent.get("status"))),
                 format_size(torrent.get("totalSize")),
                 format_percent(torrent.get("percentDone")),
                 format_eta(torrent.get("eta")),
                 format_rate(torrent.get("rateDownload")),
-                str(torrent.get("peersConnected") or 0),
+                format_peers(torrent),
                 torrent.get("name") or "",
                 key=str(torrent_id),
             )
@@ -942,7 +972,7 @@ class CuratorApp(App):
         self.update_title()
         self.update_transmission_title()
         if self.query:
-            self.run_search(self.query)
+            self.dispatch_search(self.query)
 
     def restore_cursor(self, identity: str) -> None:
         for index, result in enumerate(self.visible_results):
@@ -977,6 +1007,19 @@ class CuratorApp(App):
         if path.is_absolute():
             return path
         return self.config.config_path.parent / path
+
+    def torrent_source_is_dir(self, torrent: dict) -> bool:
+        source_dir = torrent.get("downloadDir") or ""
+        source_name = torrent.get("name") or ""
+        if not source_dir or not source_name:
+            return False
+        try:
+            source_local = self.transmission_path_to_local(source_dir) / source_name
+        except RuntimeError:
+            return Path(source_name).suffix == ""
+        if source_local.exists():
+            return source_local.is_dir()
+        return Path(source_name).suffix == ""
 
     def show_error(self, message: str, modal: bool) -> None:
         self.message = message
@@ -1025,9 +1068,7 @@ class CuratorApp(App):
     def update_transmission_title(self) -> None:
         title = self.query_one("#transmission-title", Static)
         summary = (
-            f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)} | "
-            f"Media: {self.current_media().label} | "
-            f"Library: {self.current_media().library_dir}"
+            f"Transmission: {transmission_title_url(self.config.transmission_rpc_url)}"
         )
         if isinstance(self.focused, DataTable) and self.focused.id == "transmission":
             summary = f"{summary} | Keys: Space pause, m move, x remove, r refresh"
@@ -1042,15 +1083,16 @@ class CuratorApp(App):
         labels: list[str] = []
         for label, key in RESULT_COLUMNS:
             if key == self.sort_mode:
-                labels.append(f"{label} v")
+                labels.append(f"[{label}]")
             else:
                 labels.append(label)
         return labels
 
-    def start_search(self, query: str) -> None:
+    def start_search(self, query: str, media_key: str) -> None:
         self.query = query
         self.search_in_flight = True
-        self.message = f"Searching {query!r}..."
+        media = self.config.media_types[media_key]
+        self.message = f"Searching {media.label}: {query!r}..."
         self.update_title()
         self.setup_results_table()
 
@@ -1199,6 +1241,154 @@ def search_type_for_categories(categories: tuple[str, ...]) -> str:
     return "search"
 
 
+def suggest_move_target(
+    media_key: str,
+    library_dir: Path,
+    source_name: str,
+    source_is_dir: bool,
+) -> MoveSuggestion:
+    fallback = MoveSuggestion(
+        dest_dir=str(library_dir),
+        filename=source_name,
+        message="Automatic naming: could not identify this item. Using the current name.",
+    )
+    if not source_name:
+        return fallback
+
+    normalized_media = media_key.lower()
+    is_movie_media = normalized_media in {"movies", "movie"} or normalized_media.startswith("movie")
+    is_show_media = normalized_media in {"shows", "show", "tv"} or normalized_media.startswith("show")
+    if not is_movie_media and not is_show_media:
+        return MoveSuggestion(
+            dest_dir=str(library_dir),
+            filename=source_name,
+            message=f"Automatic naming: no supported rule for media type {media_key!r}. Using the current name.",
+        )
+
+    try:
+        from guessit import guessit
+    except ImportError:
+        return MoveSuggestion(
+            dest_dir=str(library_dir),
+            filename=source_name,
+            message="Automatic naming unavailable: install dependencies from requirements.txt.",
+        )
+
+    try:
+        info = dict(guessit(source_name))
+    except Exception as error:
+        return MoveSuggestion(
+            dest_dir=str(library_dir),
+            filename=source_name,
+            message=f"Automatic naming failed: GuessIt could not parse this item ({error}).",
+        )
+
+    if is_movie_media:
+        return suggest_movie_target(library_dir, source_name, source_is_dir, info)
+    if is_show_media:
+        return suggest_episode_target(library_dir, source_name, source_is_dir, info)
+
+    return MoveSuggestion(
+        dest_dir=str(library_dir),
+        filename=source_name,
+        message=f"Automatic naming: no supported rule for media type {media_key!r}. Using the current name.",
+    )
+
+
+def suggest_movie_target(
+    library_dir: Path,
+    source_name: str,
+    source_is_dir: bool,
+    info: dict,
+) -> MoveSuggestion:
+    title = clean_path_component(scalar_text(info.get("title")))
+    if not title:
+        return MoveSuggestion(
+            dest_dir=str(library_dir),
+            filename=source_name,
+            message="Automatic naming: GuessIt did not find a movie title. Using the current name.",
+        )
+
+    year = scalar_text(info.get("year"))
+    movie_name = f"{title} ({year})" if year else title
+    message = "Automatic naming: suggested movie title/year from GuessIt."
+    if not year:
+        message = "Automatic naming: found a movie title, but no year. Review before moving."
+
+    if source_is_dir:
+        return MoveSuggestion(
+            dest_dir=str(library_dir),
+            filename=movie_name,
+            message=message,
+        )
+
+    extension = Path(source_name).suffix
+    return MoveSuggestion(
+        dest_dir=str(library_dir / movie_name),
+        filename=f"{movie_name}{extension}",
+        message=message,
+    )
+
+
+def suggest_episode_target(
+    library_dir: Path,
+    source_name: str,
+    source_is_dir: bool,
+    info: dict,
+) -> MoveSuggestion:
+    if source_is_dir:
+        return MoveSuggestion(
+            dest_dir=str(library_dir),
+            filename=source_name,
+            message="Automatic naming: episode renaming is only supported for single files.",
+        )
+
+    show = clean_path_component(scalar_text(info.get("title")))
+    season = scalar_int(info.get("season"))
+    episode = scalar_int(info.get("episode"))
+    if not show or season is None or episode is None:
+        return MoveSuggestion(
+            dest_dir=str(library_dir),
+            filename=source_name,
+            message="Automatic naming: GuessIt could not find show, season, and episode.",
+        )
+
+    episode_title = clean_path_component(scalar_text(info.get("episode_title")))
+    season_dir = f"Season {season:02d}"
+    episode_name = f"{show} - S{season:02d}E{episode:02d}"
+    if episode_title:
+        episode_name = f"{episode_name} - {episode_title}"
+    extension = Path(source_name).suffix
+    return MoveSuggestion(
+        dest_dir=str(library_dir / show / season_dir),
+        filename=f"{episode_name}{extension}",
+        message="Automatic naming: suggested episode path from GuessIt.",
+    )
+
+
+def scalar_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value).strip()
+
+
+def scalar_int(value) -> int | None:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def clean_path_component(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]+', " ", value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned
+
+
 def format_percent(value) -> str:
     if isinstance(value, (int, float)):
         return f"{value:.0%}"
@@ -1227,6 +1417,16 @@ def format_rate(value) -> str:
         if size < 1024 or unit == "GiB/s":
             return f"{size:.1f} {unit}"
         size /= 1024
+    return "?"
+
+
+def format_peers(torrent: dict) -> str:
+    active = torrent.get("peersSendingToUs")
+    connected = torrent.get("peersConnected")
+    if isinstance(active, int) and isinstance(connected, int):
+        return f"{active}/{connected}"
+    if isinstance(connected, int):
+        return str(connected)
     return "?"
 
 
