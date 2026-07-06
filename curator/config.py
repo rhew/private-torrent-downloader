@@ -10,10 +10,10 @@ DEFAULT_BASE_URL = "http://127.0.0.1:9117"
 DEFAULT_TRANSMISSION_JACKETT_BASE_URL = "http://jackett:9117"
 DEFAULT_TRANSMISSION_RPC_URL = "http://127.0.0.1:9091/transmission/rpc"
 DEFAULT_JACKETT_CONFIG_DIR = Path("../jackett-config/Jackett")
-DEFAULT_MAX_RESULTS = 30
 DEFAULT_SORT = "seeders"
 DEFAULT_MEDIA_TYPE = "movies"
 DEFAULT_TIMEOUT = 20.0
+DEFAULT_CURATOR_SERVER_URL = ""
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,9 @@ class MediaTypeConfig:
 @dataclass(frozen=True)
 class AppConfig:
     config_path: Path
+    server_url: str
+    server_token: str
+    server_request_timeout: float
     downloads_dir: Path
     jackett_base_url: str
     transmission_jackett_base_url: str
@@ -35,17 +38,30 @@ class AppConfig:
     transmission_rpc_url: str
     jackett_config_dir: Path
     timeout: float
-    max_results: int
     default_sort: str
     media_type: str
     media: MediaTypeConfig
     media_types: dict[str, MediaTypeConfig]
 
 
+@dataclass(frozen=True)
+class ServerConfig:
+    config_path: Path
+    downloads_root: Path
+    library_root: Path
+    jackett_base_url: str
+    transmission_jackett_base_url: str
+    jackett_admin_password: str
+    transmission_rpc_url: str
+    jackett_config_dir: Path
+    timeout: float
+
+
 def load_config(config_path: Path) -> AppConfig:
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
     base_dir = config_path.parent
 
+    curator = data.get("curator", {})
     jackett = data.get("jackett", {})
     network = data.get("network", {})
     paths = data.get("paths", {})
@@ -63,7 +79,7 @@ def load_config(config_path: Path) -> AppConfig:
             label=str(value.get("label", key.replace("_", " ").title())),
             indexers=tuple(_parse_indexers(value.get("indexers", ()))),
             categories=tuple(_parse_categories(value.get("categories", ()))),
-            library_dir=_resolve_path(base_dir, str(value["library_dir"])),
+            library_dir=Path(str(value["library_dir"])),
         )
         for key, value in media_types.items()
     }
@@ -75,6 +91,14 @@ def load_config(config_path: Path) -> AppConfig:
 
     return AppConfig(
         config_path=config_path,
+        server_url=os.environ.get(
+            "CURATOR_SERVER_URL",
+            str(curator.get("server_url", DEFAULT_CURATOR_SERVER_URL)),
+        ),
+        server_token=os.environ.get("CURATOR_TOKEN", str(curator.get("token", ""))),
+        server_request_timeout=float(
+            curator.get("request_timeout", float(network.get("timeout", DEFAULT_TIMEOUT)) + 5.0)
+        ),
         downloads_dir=_resolve_path(
             base_dir,
             os.environ.get("CURATOR_DOWNLOADS_DIR", str(downloads_dir)),
@@ -100,11 +124,56 @@ def load_config(config_path: Path) -> AppConfig:
             ),
         ),
         timeout=float(network.get("timeout", DEFAULT_TIMEOUT)),
-        max_results=int(ui.get("max_results", DEFAULT_MAX_RESULTS)),
         default_sort=str(ui.get("default_sort", DEFAULT_SORT)),
         media_type=selected_media_type,
         media=media_data,
         media_types=parsed_media_types,
+    )
+
+
+def load_server_config(config_path: Path) -> ServerConfig:
+    data = tomllib.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    base_dir = config_path.parent
+
+    jackett = data.get("jackett", {})
+    network = data.get("network", {})
+    paths = data.get("paths", {})
+    transmission = data.get("transmission", {})
+
+    return ServerConfig(
+        config_path=config_path,
+        downloads_root=_resolve_path(
+            base_dir,
+            os.environ.get("CURATOR_DOWNLOADS_ROOT", str(paths.get("downloads_root", "../downloads"))),
+        ),
+        library_root=_resolve_path(
+            base_dir,
+            os.environ.get("CURATOR_LIBRARY_ROOT", str(paths.get("library_root", "../library"))),
+        ),
+        jackett_base_url=os.environ.get(
+            "CURATOR_JACKETT_BASE_URL",
+            str(jackett.get("base_url", DEFAULT_BASE_URL)),
+        ),
+        transmission_jackett_base_url=os.environ.get(
+            "CURATOR_TRANSMISSION_JACKETT_BASE_URL",
+            str(jackett.get("transmission_base_url", DEFAULT_TRANSMISSION_JACKETT_BASE_URL)),
+        ),
+        jackett_admin_password=os.environ.get(
+            "CURATOR_JACKETT_ADMIN_PASSWORD",
+            str(jackett.get("admin_password", "")),
+        ),
+        transmission_rpc_url=os.environ.get(
+            "CURATOR_TRANSMISSION_RPC_URL",
+            str(transmission.get("rpc_url", DEFAULT_TRANSMISSION_RPC_URL)),
+        ),
+        jackett_config_dir=_resolve_path(
+            base_dir,
+            os.environ.get(
+                "CURATOR_JACKETT_CONFIG_DIR",
+                str(jackett.get("config_dir", str(DEFAULT_JACKETT_CONFIG_DIR))),
+            ),
+        ),
+        timeout=float(os.environ.get("CURATOR_NETWORK_TIMEOUT", network.get("timeout", DEFAULT_TIMEOUT))),
     )
 
 

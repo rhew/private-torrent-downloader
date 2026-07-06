@@ -1,0 +1,23 @@
+[curator]
+server_url = "http://127.0.0.1:8787"
+request_timeout = 25
+# token = "replace-me"
+
+[network]
+timeout = 20
+
+[ui]
+default_media_type = "books"
+default_sort = "seeders"
+
+[media_types.books]
+label = "Books"
+indexers = ["internetarchive"]
+categories = [7000]
+library_dir = "books"
+
+[media_types.isos]
+label = "ISOs"
+indexers = ["internetarchive", "linuxtracker"]
+categories = [4020]
+library_dir = "isos"

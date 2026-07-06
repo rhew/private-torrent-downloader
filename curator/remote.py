@@ -5,28 +5,46 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
-from .client import JackettIndexer, SearchResult
-from .config import AppConfig, MediaTypeConfig
+from .client import SearchResult
+from .config import MediaTypeConfig
 from .core import MoveSuggestion
 
 
 class CuratorRemoteClient:
-    def __init__(self, base_url: str, token: str = "", timeout: float = 30):
+    def __init__(
+        self,
+        base_url: str,
+        token: str = "",
+        request_timeout: float = 30,
+        search_timeout: float = 20,
+    ):
         self.base_url = base_url.rstrip("/")
         self.token = token
-        self.timeout = timeout
+        self.request_timeout = request_timeout
+        self.search_timeout = search_timeout
 
-    def config(self) -> dict[str, Any]:
-        return self.get("/api/config")
+    def reconcile_indexers(self, media_types: dict[str, MediaTypeConfig]) -> dict[str, Any]:
+        return self.post(
+            "/api/indexers/reconcile",
+            {
+                "media_types": media_types_payload(media_types),
+                "media_keys": list(media_types),
+                "timeout": self.search_timeout,
+            },
+        )
 
-    def reconcile_indexers(self) -> dict[str, Any]:
-        return self.post("/api/indexers/reconcile", {})
-
-    def search(self, media_key: str, query: str) -> tuple[list[SearchResult], dict[str, str]]:
-        data = self.post("/api/search", {"media_key": media_key, "query": query})
+    def search(self, media: MediaTypeConfig, query: str) -> tuple[list[SearchResult], dict[str, str]]:
+        data = self.post(
+            "/api/search",
+            {
+                "media": media_payload(media),
+                "media_key": media.key,
+                "query": query,
+                "timeout": self.search_timeout,
+            },
+        )
         return [search_result_from_dict(item) for item in data.get("results", [])], dict(data.get("errors", {}))
 
     def torrents(self) -> list[dict]:
@@ -39,8 +57,15 @@ class CuratorRemoteClient:
         data = self.post("/api/torrents/control", {"action": action, "torrent_id": torrent_id})
         return list(data.get("torrents", []))
 
-    def move_suggestion(self, media_key: str, torrent: dict) -> MoveSuggestion:
-        data = self.post("/api/move/suggest", {"media_key": media_key, "torrent": torrent})
+    def move_suggestion(self, media: MediaTypeConfig, torrent: dict) -> MoveSuggestion:
+        data = self.post(
+            "/api/move/suggest",
+            {
+                "media": media_payload(media),
+                "media_key": media.key,
+                "torrent": torrent,
+            },
+        )
         return MoveSuggestion(
             dest_dir=str(data.get("dest_dir") or ""),
             filename=str(data.get("filename") or ""),
@@ -87,7 +112,7 @@ class CuratorRemoteClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
                 body = response.read()
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")
@@ -95,37 +120,31 @@ class CuratorRemoteClient:
                 details = json.loads(body)
             except json.JSONDecodeError:
                 details = {"error": body or error.reason}
-            raise RuntimeError(details.get("error") or error.reason) from error
+            message = str(details.get("error") or error.reason)
+            if "missing field: 'media_key'" in message:
+                message = (
+                    "Curator server expects the older API shape. Rebuild/restart the server, "
+                    "or point the client at the updated server."
+                )
+            raise RuntimeError(message) from error
         return json.loads(body.decode("utf-8"))
 
 
-def app_config_from_remote(snapshot: dict[str, Any], server_url: str) -> AppConfig:
-    media_types = {
-        key: MediaTypeConfig(
-            key=str(value["key"]),
-            label=str(value["label"]),
-            indexers=tuple(str(item) for item in value.get("indexers", ())),
-            categories=tuple(str(item) for item in value.get("categories", ())),
-            library_dir=Path(str(value["library_dir"])),
-        )
-        for key, value in snapshot["media_types"].items()
+def media_types_payload(media_types: dict[str, MediaTypeConfig]) -> dict[str, dict[str, Any]]:
+    return {
+        key: media_payload(media)
+        for key, media in media_types.items()
     }
-    media_type = str(snapshot["media_type"])
-    return AppConfig(
-        config_path=Path("."),
-        downloads_dir=Path(str(snapshot.get("downloads_dir") or ".")),
-        jackett_base_url=server_url,
-        transmission_jackett_base_url=server_url,
-        jackett_admin_password="",
-        transmission_rpc_url=str(snapshot.get("transmission_url") or server_url),
-        jackett_config_dir=Path("."),
-        timeout=float(snapshot.get("timeout") or 30),
-        max_results=int(snapshot.get("max_results") or 30),
-        default_sort=str(snapshot.get("default_sort") or "seeders"),
-        media_type=media_type,
-        media=media_types[media_type],
-        media_types=media_types,
-    )
+
+
+def media_payload(media: MediaTypeConfig) -> dict[str, Any]:
+    return {
+        "key": media.key,
+        "label": media.label,
+        "indexers": list(media.indexers),
+        "categories": list(media.categories),
+        "library_dir": str(media.library_dir),
+    }
 
 
 def search_result_from_dict(data: dict[str, Any]) -> SearchResult:

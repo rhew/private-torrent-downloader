@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import os
 from pathlib import PurePosixPath
 from pathlib import Path
 import shutil
@@ -37,7 +36,7 @@ from .core import (
     suggest_move_target,
     usable_indexers,
 )
-from .remote import CuratorRemoteClient, app_config_from_remote
+from .remote import CuratorRemoteClient
 
 
 RESULT_COLUMNS = (
@@ -509,11 +508,11 @@ class CuratorApp(App):
         source_dir = torrent.get("downloadDir") or ""
         try:
             if self.remote:
-                suggestion = self.remote.move_suggestion(self.current_media_key, torrent)
+                suggestion = self.remote.move_suggestion(self.current_media(), torrent)
             else:
                 suggestion = suggest_move_target(
                     media_key=self.current_media_key,
-                    library_dir=self.current_media().library_dir,
+                    library_dir=self.local_dest_path(str(self.current_media().library_dir)),
                     source_name=source_name,
                     source_is_dir=self.torrent_source_is_dir(torrent),
                 )
@@ -595,10 +594,14 @@ class CuratorApp(App):
     def run_search(self, query: str, media_key: str, search_id: int) -> None:
         if self.remote:
             try:
-                results, errors = self.remote.search(media_key, query)
+                results, errors = self.remote.search(self.config.media_types[media_key], query)
             except Exception as error:
-                self.call_from_thread(self.show_error, f"Search failed: {error}", True)
-                self.call_from_thread(self.set_results, [], {}, media_key, search_id)
+                self.call_from_thread(
+                    self.finish_search_failure,
+                    f"Search failed: {error}",
+                    media_key,
+                    search_id,
+                )
                 return
             self.call_from_thread(self.set_results, results, errors, media_key, search_id)
             return
@@ -609,8 +612,12 @@ class CuratorApp(App):
             try:
                 catalog = fetch_indexers(self.api_key, self.config.jackett_base_url, self.config.timeout)
             except Exception as error:
-                self.call_from_thread(self.show_error, f"Jackett indexer check failed: {error}", True)
-                self.call_from_thread(self.set_results, [], {}, media_key, search_id)
+                self.call_from_thread(
+                    self.finish_search_failure,
+                    f"Jackett indexer check failed: {error}",
+                    media_key,
+                    search_id,
+                )
                 return
             self.call_from_thread(self.set_indexer_catalog, catalog)
 
@@ -633,12 +640,18 @@ class CuratorApp(App):
         )
         self.call_from_thread(self.set_results, results, config_errors | errors, media_key, search_id)
 
+    def finish_search_failure(self, message: str, media_key: str, search_id: int) -> None:
+        if search_id != self.search_request_id or media_key != self.current_media_key:
+            return
+        self.show_error(message, True)
+        self.set_results([], {}, media_key, search_id)
+
     @work(thread=True)
     def reconcile_indexers(self) -> None:
         self.call_from_thread(self.update_status, "Checking Jackett indexers...")
         if self.remote:
             try:
-                data = self.remote.reconcile_indexers()
+                data = self.remote.reconcile_indexers(self.config.media_types)
             except Exception as error:
                 self.call_from_thread(self.show_error, f"Jackett indexer check failed: {error}", False)
                 return
@@ -974,16 +987,18 @@ class CuratorApp(App):
 
     def sorted_results(self) -> list[SearchResult]:
         if self.sort_mode == "seeders":
-            return sorted(self.results, key=lambda result: result.seeders_value, reverse=True)
-        if self.sort_mode == "leechers":
-            return sorted(self.results, key=lambda result: result.leechers_value, reverse=True)
-        if self.sort_mode == "size":
-            return sorted(self.results, key=lambda result: result.size_bytes, reverse=True)
-        if self.sort_mode == "indexer":
-            return sorted(self.results, key=lambda result: (result.indexer, result.title.lower()))
-        if self.sort_mode == "title":
-            return sorted(self.results, key=lambda result: result.title.lower())
-        return sorted(self.results, key=lambda result: result.seeders_value, reverse=True)
+            results = sorted(self.results, key=lambda result: result.seeders_value, reverse=True)
+        elif self.sort_mode == "leechers":
+            results = sorted(self.results, key=lambda result: result.leechers_value, reverse=True)
+        elif self.sort_mode == "size":
+            results = sorted(self.results, key=lambda result: result.size_bytes, reverse=True)
+        elif self.sort_mode == "indexer":
+            results = sorted(self.results, key=lambda result: (result.indexer, result.title.lower()))
+        elif self.sort_mode == "title":
+            results = sorted(self.results, key=lambda result: result.title.lower())
+        else:
+            results = sorted(self.results, key=lambda result: result.seeders_value, reverse=True)
+        return results
 
     def current_result(self) -> SearchResult | None:
         if not self.visible_results:
@@ -1267,21 +1282,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("curator/config.toml"),
-        help="TOML config path for local mode (default: curator/config.toml)",
+        default=Path("curator/client.toml"),
+        help="Client TOML config path (default: curator/client.toml)",
     )
     parser.add_argument("--server-url", help="Curator server URL, for example http://lenny:8787")
-    parser.add_argument("--token", default=os.environ.get("CURATOR_TOKEN", ""), help="Bearer token for Curator server")
-    parser.add_argument("--remote-timeout", type=float, default=30.0, help="Remote server request timeout")
+    parser.add_argument("--token", help="Bearer token for Curator server")
+    parser.add_argument("--remote-timeout", type=float, help="Remote server request timeout")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.server_url:
-        remote = CuratorRemoteClient(args.server_url, args.token, args.remote_timeout)
-        config = app_config_from_remote(remote.config(), args.server_url)
+    config = load_config(args.config)
+    server_url = args.server_url or config.server_url
+    if server_url:
+        token = args.token if args.token is not None else config.server_token
+        request_timeout = (
+            args.remote_timeout
+            if args.remote_timeout is not None
+            else config.server_request_timeout
+        )
+        remote = CuratorRemoteClient(server_url, token, request_timeout, config.timeout)
         CuratorApp(config, remote).run()
     else:
-        config = load_config(args.config)
         CuratorApp(config).run()

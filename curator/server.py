@@ -20,7 +20,7 @@ from .client import (
     load_api_key,
     search_indexers,
 )
-from .config import AppConfig, load_config
+from .config import MediaTypeConfig, ServerConfig, load_server_config
 from .core import (
     desired_indexers_by_media,
     indexer_reconciliation_failure_count,
@@ -31,7 +31,7 @@ from .core import (
 
 
 class CuratorService:
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: ServerConfig):
         self.config = config
         self.api_key: str | None = None
         self.jackett_indexers: dict[str, JackettIndexer] = {}
@@ -43,29 +43,22 @@ class CuratorService:
 
     def config_snapshot(self) -> dict[str, Any]:
         return {
-            "downloads_dir": str(self.config.downloads_dir),
+            "downloads_root": str(self.config.downloads_root),
+            "library_root": str(self.config.library_root),
             "transmission_url": self.config.transmission_rpc_url,
-            "timeout": self.config.timeout,
-            "max_results": self.config.max_results,
-            "default_sort": self.config.default_sort,
-            "media_type": self.config.media_type,
-            "media_types": {
-                key: {
-                    "key": media.key,
-                    "label": media.label,
-                    "indexers": list(media.indexers),
-                    "categories": list(media.categories),
-                    "library_dir": str(media.library_dir),
-                }
-                for key, media in self.config.media_types.items()
-            },
+            "max_timeout": self.config.timeout,
         }
 
-    def reconcile_indexers(self) -> dict[str, Any]:
-        desired = desired_indexers_by_media(self.config.media_types)
+    def reconcile_indexers(
+        self,
+        media_types: dict[str, MediaTypeConfig],
+        requested_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        desired = desired_indexers_by_media(media_types)
         api_key = self.jackett_api_key()
-        catalog = fetch_indexers(api_key, self.config.jackett_base_url, self.config.timeout)
-        catalog, enabled, failed = self.enable_missing_indexers(tuple(desired), catalog)
+        timeout = self.effective_timeout(requested_timeout)
+        catalog = fetch_indexers(api_key, self.config.jackett_base_url, timeout)
+        catalog, enabled, failed = self.enable_missing_indexers(tuple(desired), catalog, timeout)
         self.jackett_indexers = catalog
         report_lines = indexer_reconciliation_report(desired, catalog, enabled, failed)
         return {
@@ -79,6 +72,7 @@ class CuratorService:
         self,
         indexers: tuple[str, ...],
         catalog: dict[str, JackettIndexer],
+        timeout: float,
     ) -> tuple[dict[str, JackettIndexer], list[str], dict[str, str]]:
         missing = [
             indexer
@@ -96,7 +90,7 @@ class CuratorService:
                     indexer,
                     self.config.jackett_base_url,
                     self.config.jackett_admin_password,
-                    self.config.timeout,
+                    timeout,
                 )
             except Exception as error:
                 errors[indexer] = str(error)
@@ -104,20 +98,25 @@ class CuratorService:
                 enabled.append(indexer)
 
         try:
-            catalog = fetch_indexers(self.jackett_api_key(), self.config.jackett_base_url, self.config.timeout)
+            catalog = fetch_indexers(self.jackett_api_key(), self.config.jackett_base_url, timeout)
         except Exception as error:
             errors["jackett"] = f"could not refresh indexer list: {error}"
             return catalog, enabled, errors
 
         return catalog, enabled, errors
 
-    def search(self, media_key: str, query: str) -> dict[str, Any]:
-        media = self.config.media_types[media_key]
+    def search(
+        self,
+        media: MediaTypeConfig,
+        query: str,
+        requested_timeout: float | None = None,
+    ) -> dict[str, Any]:
         api_key = self.jackett_api_key()
+        timeout = self.effective_timeout(requested_timeout)
         catalog = self.jackett_indexers or fetch_indexers(
             api_key,
             self.config.jackett_base_url,
-            self.config.timeout,
+            timeout,
         )
         self.jackett_indexers = catalog
         active_indexers, config_errors = usable_indexers(media.indexers, media.categories, catalog)
@@ -130,12 +129,17 @@ class CuratorService:
             media.categories,
             api_key,
             self.config.jackett_base_url,
-            self.config.timeout,
+            timeout,
         )
         return {
             "results": [asdict(result) for result in results],
             "errors": config_errors | errors,
         }
+
+    def effective_timeout(self, requested_timeout: float | None) -> float:
+        if requested_timeout is None:
+            return self.config.timeout
+        return max(1.0, min(float(requested_timeout), self.config.timeout))
 
     def add_download(self, result: SearchResult) -> dict[str, Any]:
         arguments = build_torrent_add_arguments(
@@ -165,11 +169,10 @@ class CuratorService:
             raise ValueError(f"unsupported torrent action: {action}")
         return {"torrents": client.get_torrents()}
 
-    def move_suggestion(self, media_key: str, torrent: dict) -> dict[str, Any]:
-        media = self.config.media_types[media_key]
+    def move_suggestion(self, media: MediaTypeConfig, torrent: dict) -> dict[str, Any]:
         source_name = torrent.get("name") or ""
         suggestion = suggest_move_target(
-            media_key=media_key,
+            media_key=media.key,
             library_dir=media.library_dir,
             source_name=source_name,
             source_is_dir=self.torrent_source_is_dir(torrent),
@@ -218,13 +221,13 @@ class CuratorService:
             raise RuntimeError(f"Transmission path is not absolute: {transmission_path}")
         if not path.parts or path.parts[1] != "downloads":
             raise RuntimeError(f"Only /downloads paths are supported: {transmission_path}")
-        return self.config.downloads_dir.joinpath(*path.parts[2:])
+        return self.config.downloads_root.joinpath(*path.parts[2:])
 
     def local_dest_path(self, path_text: str) -> Path:
         path = Path(path_text)
         if path.is_absolute():
             return path
-        return self.config.config_path.parent / path
+        return self.config.library_root / path
 
     def torrent_source_is_dir(self, torrent: dict) -> bool:
         source_dir = torrent.get("downloadDir") or ""
@@ -264,9 +267,20 @@ class CuratorRequestHandler(BaseHTTPRequestHandler):
         try:
             payload = self.read_json()
             if self.path == "/api/indexers/reconcile":
-                self.write_json(self.server.service.reconcile_indexers())
+                self.write_json(
+                    self.server.service.reconcile_indexers(
+                        media_types_from_dict(payload["media_types"]),
+                        optional_timeout(payload.get("timeout")),
+                    )
+                )
             elif self.path == "/api/search":
-                self.write_json(self.server.service.search(str(payload["media_key"]), str(payload["query"])))
+                self.write_json(
+                    self.server.service.search(
+                        media_type_from_dict(payload["media"]),
+                        str(payload["query"]),
+                        optional_timeout(payload.get("timeout")),
+                    )
+                )
             elif self.path == "/api/downloads/add":
                 self.write_json(self.server.service.add_download(search_result_from_dict(payload["result"])))
             elif self.path == "/api/torrents/control":
@@ -279,7 +293,7 @@ class CuratorRequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/move/suggest":
                 self.write_json(
                     self.server.service.move_suggestion(
-                        str(payload["media_key"]),
+                        media_type_from_dict(payload["media"]),
                         payload["torrent"],
                     )
                 )
@@ -354,9 +368,35 @@ def search_result_from_dict(data: dict[str, Any]) -> SearchResult:
     )
 
 
+def media_types_from_dict(data: dict[str, Any]) -> dict[str, MediaTypeConfig]:
+    return {
+        str(key): media_type_from_dict(value)
+        for key, value in data.items()
+    }
+
+
+def media_type_from_dict(data: dict[str, Any]) -> MediaTypeConfig:
+    return MediaTypeConfig(
+        key=str(data["key"]),
+        label=str(data.get("label") or data["key"]),
+        indexers=tuple(str(item) for item in data.get("indexers", ())),
+        categories=tuple(str(item) for item in data.get("categories", ())),
+        library_dir=Path(str(data.get("library_dir") or data["key"])),
+    )
+
+
+def optional_timeout(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid timeout: {value!r}") from None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Curator HTTP server.")
-    parser.add_argument("--config", type=Path, default=Path("curator/config.toml"))
+    parser.add_argument("--config", type=Path, default=Path("curator/server.toml"))
     parser.add_argument("--host", default=os.environ.get("CURATOR_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CURATOR_PORT", "8787")))
     parser.add_argument("--token", default=os.environ.get("CURATOR_TOKEN", ""))
@@ -365,7 +405,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    service = CuratorService(load_config(args.config))
+    service = CuratorService(load_server_config(args.config))
     server = CuratorHTTPServer((args.host, args.port), CuratorRequestHandler, service, args.token)
     print(f"Curator server listening on http://{args.host}:{args.port}")
     server.serve_forever()
