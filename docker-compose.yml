@@ -56,6 +56,8 @@ services:
     container_name: gluetun
     cap_add:
       - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
     ports:
       - 8888:8888/tcp # HTTP proxy
       - 8388:8388/tcp # Shadowsocks
@@ -63,21 +65,28 @@ services:
       ###### Transmission Ports
       - 9091:9091
     volumes:
-      - ./vpngate.ovpn:/gluetun/custom.conf
+      - ./gluetun:/gluetun
     environment:
       - VPN_SERVICE_PROVIDER=custom
       - VPN_TYPE=openvpn
-      - OPENVPN_CUSTOM_CONFIG=/gluetun/custom.conf
+      - OPENVPN_CUSTOM_CONFIG=/gluetun/vpngate.ovpn
       - OPENVPN_CIPHERS=AES-256-GCM,AES-128-GCM,AES-128-CBC
+      - TZ=${TZ:-America/New_York}
     restart: always
 
-  minidlna:
-    image: vladgh/minidlna
-    container_name: minidlna
-    network_mode: "host"
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-992}"
     environment:
-      - MINIDLNA_MEDIA_DIR=/media
-      - MINIDLNA_FRIENDLY_NAME=${MINIDLNA_FRIENDLY_NAME:-miniDLNA}
+      - TZ=${TZ:-America/New_York}
+    network_mode: host
     volumes:
+      - ./data/jellyfin/config:/config
+      - ./data/jellyfin/cache:/cache
       - ${LIBRARY_DIR:-./library}:/media
+      - /dev/dri:/dev/dri
     restart: always

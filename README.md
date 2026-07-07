@@ -3,12 +3,43 @@
 Three pieces:
 
 1. A script to select a VPN from VPN Gate
-2. A Compose file to create the VPN with GlueTun, run Transmission, run Jackett, and run the miniDLNA server.
+2. A Compose file to create the VPN with GlueTun, run Transmission, run Jackett, and run Jellyfin.
 3. A `curator` TUI and optional Curator server. The server owns Jackett, Transmission, and filesystem operations; the TUI can run locally against that server from another machine.
+
+## Media File Layout
+
+By default the compose file mounts repo-local `downloads/` and `library/` directories. Override them with `DOWNLOADS_DIR` and `LIBRARY_DIR` in `.env` when the storage lives elsewhere.
+
+```text
+downloads/        # transmission stages
+  incomplete/
+  complete/
+    movies/
+    shows/
+    etc...
+
+library/          # Jellyfin serves
+  movies/
+  shows/
+  etc...
+```
+
+## Networking design:
+
+  - Gluetun owns the VPN connection, using a generated VPNGate OpenVPN config.
+  - Transmission shares Gluetun's network namespace.
+    - Transmission ports are published on the Gluetun service, not the Transmission service.
+    - Gluetun's firewall is the fail-closed boundary.
+  - Jackett and curator stay on the normal Docker network unless there is a clear reason to proxy them.
+  - Curator imports completed downloads from `downloads/` and writes managed media to `library/`.
+  - Jellyfin stays on host networking if that remains the simplest way to support DLNA discovery.
+    - Jellyfin mounts `library/` read/write so it can store local images and metadata next to media files.
+  - Expose admin UIs on the LAN.
+
 
 ## Init
 
-### Create a local `.env` from the example and set UID, GID, and mount paths.
+### Create a local `.env` from the example and set UID, GID, mount paths, and VPNGate filters.
 
 ```bash
 cp .env.example .env
@@ -22,7 +53,17 @@ APP_GID=1000
 DOWNLOADS_DIR=./downloads
 LIBRARY_DIR=./library
 JACKETT_CONFIG_DIR=./jackett-config
-MINIDLNA_FRIENDLY_NAME=MyCoolMedia
+```
+
+`APP_UID` and `APP_GID` are passed to LinuxServer containers as `PUID` and `PGID`. Set these when needed:
+
+```dotenv
+VPNGATE_MIN_SPEED=5000000
+VPNGATE_MAX_PING=300
+VPNGATE_MIN_UPTIME=86400
+# VPNGATE_COUNTRY=US
+VIDEO_GID=44
+RENDER_GID=992
 ```
 
 
@@ -65,7 +106,7 @@ categories = [4020]
 
 - `label` is the name UI will use for the media type.
 - `library_dir` is where `m` archives completed downloads by default. Relative paths are resolved by the server under its configured library root.
-- `indexers` are the Jackett indexer ids Curator will query. See "How to find available indexers" below. In this example: `internetarchive`, `linuxtracker`.
+- `indexers` are the Jackett indexer ids Curator will query. Look at the [indexer definition files for Jackett](https://github.com/Jackett/Jackett/tree/master/src/Jackett.Common/Definitions). The token you put in `curator/client.toml` is the definition filename without the `.yml` suffix.
 - `categories` are numeric Jackett/Torznab category ids. See the [Jackett Categories Wiki](https://github.com/Jackett/Jackett/wiki/Jackett-Categories). Examples:
   - `2000` = `Movies`
   - `2040` = `Movies/HD`
@@ -79,53 +120,43 @@ Start from the server example config on the machine where Docker runs:
 cp curator/server.example.toml curator/server.toml
 ```
 
-The server config contains only server-local infrastructure: Jackett URL/config path, Transmission RPC URL, downloads root, library root, and a maximum backend timeout. It does not define media types, UI defaults, indexers, or categories.
-
-### How to find available indexers
-
-Jackett keeps one definition file per indexer [in its repository](https://github.com/Jackett/Jackett/tree/master/src/Jackett.Common/Definitions). The token you put in `curator/client.toml` is the definition filename without
-the `.yml` suffix. Examples:
-
-- `internetarchive.yml` -> `internetarchive`
-- `linuxtracker.yml` -> `linuxtracker`
-
-Current shipped examples also include:
-
-- `bibliotik.yml` -> `bibliotik`
-- `booktracker.yml` -> `booktracker`
-- `audionews.yml` -> `audionews`
-
-The example config includes `books` and `audiobooks` media types. The shipped
-defaults use public sources so those profiles work without extra account setup:
-
-- `books` uses `internetarchive`
-- `audiobooks` uses `internetarchive`
-
-If you want closer parity with dedicated book and audiobook trackers, the
-closest Jackett-supported matches I confirmed upstream are:
-
-- `bibliotik` for ebooks and audiobooks
-- `booktracker` for books
-- `audionews` for audiobooks
-
-Those require extra setup and are not good zero-config defaults.
-
-I did not confirm current Jackett definitions for `audiobookbay` or Anna's
-Archive, so those are not in the shipped config.
-
 ## Run
 
-### Create/update an `ovpn` file (`vpngate.ovpn`).
+### Generate the VPNGate config
 
-```
+```bash
 python3 vpngate.py
 ```
 
-### Start Transmission, GlueTun, Jackett, Curator server, and the miniDLNA server.
+This writes `gluetun/vpngate.ovpn` and `gluetun/vpngate-state.json`.
+
+### Start Transmission, GlueTun, Jackett, Curator server, and Jellyfin.
 
 ```
 docker-compose up -d
 ```
+
+### Refresh the VPNGate endpoint and recreate the VPN/transmission stack
+
+```
+./vpn-refresh
+```
+
+### Configure Jellyfin
+
+  1. Open the Jellyfin Web UI.
+  2. Finish the first-run setup.
+  3. Add `/media/movies` as the movie library path.
+  4. Enable options like "Automatically add to collection" and "Save artwerk into media folders."
+  artwork and metadata options you want Jellyfin to store next to media files.
+  5. Enable Intel hardware transcoding in the admin dashboard:
+
+     ```text
+     Dashboard -> Playback -> Transcoding
+     ```
+
+  Enable hardware acceleration and select the Intel VA-API / Quick Sync option that Jellyfin offers for `/dev/dri`.
+
 
 ### Start the Curator TUI
 
@@ -139,28 +170,6 @@ python3 -m curator
 ```bash
 python3 -m curator --server-url http://lenny:8787
 ```
-
-Run the server in Docker on the machine that owns the downloads, library, Jackett config, and Transmission instance:
-
-```bash
-docker compose up -d curator-server
-```
-
-Then run the TUI from your laptop with its own `curator/client.toml`.
-
-If `CURATOR_TOKEN` is set in the server `.env`, set the same token in the client environment or in the client TOML:
-
-```bash
-CURATOR_TOKEN='replace-me' python3 -m curator --server-url http://lenny:8787
-```
-
-In server mode the TUI does not need local access to Jackett config, Transmission, downloads, or the library. It only talks to the Curator HTTP API. The client sends media definitions to the server for indexer reconciliation, search, and archive suggestions. The server owns Jackett, Transmission, and filesystem mutations.
-
-The Docker service overrides network URLs for container-to-container access:
-
-- `CURATOR_JACKETT_BASE_URL=http://jackett:9117`
-- `CURATOR_TRANSMISSION_JACKETT_BASE_URL=http://jackett:9117`
-- `CURATOR_TRANSMISSION_RPC_URL=http://gluetun:9091/transmission/rpc`
 
 ## Problems
 

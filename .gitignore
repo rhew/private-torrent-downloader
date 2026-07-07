@@ -3,6 +3,10 @@
 downloads/
 library/
 vpngate.ovpn
+gluetun/vpngate.ovpn
+gluetun/vpngate-state.json
+gluetun/servers.json
+data/jellyfin/
 docker-compose.override.yml
 __pycache__/
 jackett-config/*
