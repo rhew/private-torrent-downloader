@@ -1285,7 +1285,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("curator/client.toml"),
         help="Client TOML config path (default: curator/client.toml)",
     )
-    parser.add_argument("--server-url", help="Curator server URL, for example http://lenny:8787")
+    parser.add_argument("--server-url", help="Curator server URL, for example http://127.0.0.1:8787")
     parser.add_argument("--token", help="Bearer token for Curator server")
     parser.add_argument("--remote-timeout", type=float, help="Remote server request timeout")
     return parser.parse_args()

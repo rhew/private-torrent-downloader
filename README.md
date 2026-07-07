@@ -14,28 +14,26 @@ By default the compose file mounts repo-local `downloads/` and `library/` direct
 downloads/        # transmission stages
   incomplete/
   complete/
-    movies/
-    shows/
+    books/
+    isos/
     etc...
 
 library/          # Jellyfin serves
-  movies/
-  shows/
+  books/
+  isos/
   etc...
 ```
 
-## Networking design:
+## Networking Design
 
-  - Gluetun owns the VPN connection, using a generated VPNGate OpenVPN config.
-  - Transmission shares Gluetun's network namespace.
-    - Transmission ports are published on the Gluetun service, not the Transmission service.
-    - Gluetun's firewall is the fail-closed boundary.
-  - Jackett and curator stay on the normal Docker network unless there is a clear reason to proxy them.
-  - Curator imports completed downloads from `downloads/` and writes managed media to `library/`.
-  - Jellyfin stays on host networking if that remains the simplest way to support DLNA discovery.
-    - Jellyfin mounts `library/` read/write so it can store local images and metadata next to media files.
-  - Expose admin UIs on the LAN.
-
+- Gluetun owns the VPN connection, using a generated VPNGate OpenVPN config.
+- Transmission shares Gluetun's network namespace.
+- Transmission ports are published on the Gluetun service, not the Transmission service.
+- Gluetun's firewall is the fail-closed boundary.
+- Jackett and Curator stay on the normal Docker network unless there is a clear reason to proxy them.
+- Curator imports completed downloads from `downloads/` and writes managed media to `library/`.
+- Jellyfin uses host networking for simpler discovery and serves the mounted `library/` tree.
+- Expose admin UIs only where you intend to manage them.
 
 ## Init
 
@@ -67,11 +65,13 @@ RENDER_GID=992
 ```
 
 
-### Make the `downloads` and `library` directories (or update `docker-compose.yml` to point to your existing directory).
+### Make the local data directories, or update `.env` to point to existing storage.
 
 ```
-mkdir downloads library
+mkdir -p downloads library data/jellyfin/config data/jellyfin/cache gluetun
 ```
+
+The directories mounted into containers must be writable by `APP_UID:APP_GID`. This matters for `downloads/`, `library/`, `jackett-config/`, and `data/jellyfin/`.
 
 ### Configure the Curator client
 
@@ -85,7 +85,7 @@ Set the Curator server URL:
 
 ```toml
 [curator]
-server_url = "http://lenny:8787"
+server_url = "http://127.0.0.1:8787"
 request_timeout = 25
 ```
 
@@ -133,7 +133,7 @@ This writes `gluetun/vpngate.ovpn` and `gluetun/vpngate-state.json`.
 ### Start Transmission, GlueTun, Jackett, Curator server, and Jellyfin.
 
 ```
-docker-compose up -d
+docker compose up -d
 ```
 
 ### Refresh the VPNGate endpoint and recreate the VPN/transmission stack
@@ -144,19 +144,18 @@ docker-compose up -d
 
 ### Configure Jellyfin
 
-  1. Open the Jellyfin Web UI.
-  2. Finish the first-run setup.
-  3. Add `/media/movies` as the movie library path.
-  4. Enable options like "Automatically add to collection" and "Save artwerk into media folders."
-  artwork and metadata options you want Jellyfin to store next to media files.
-  5. Enable Intel hardware transcoding in the admin dashboard:
+Open `http://localhost:8096` on the Docker host, or replace `localhost` with the host name when accessing it remotely.
 
-     ```text
-     Dashboard -> Playback -> Transcoding
-     ```
+1. Finish the first-run setup.
+2. Add library paths such as `/media/books` and `/media/isos`.
+3. Enable the artwork and metadata options you want Jellyfin to store next to media files.
+4. If equipped, enable Intel hardware transcoding in the admin dashboard.
 
-  Enable hardware acceleration and select the Intel VA-API / Quick Sync option that Jellyfin offers for `/dev/dri`.
+```text
+Dashboard -> Playback -> Transcoding
+```
 
+Enable hardware acceleration and select the Intel VA-API / Quick Sync option that Jellyfin offers for `/dev/dri`.
 
 ### Start the Curator TUI
 
@@ -168,10 +167,10 @@ python3 -m curator
 `python3 -m curator` uses `server_url` from `curator/client.toml`. You can override it from the command line:
 
 ```bash
-python3 -m curator --server-url http://lenny:8787
+python3 -m curator --server-url http://127.0.0.1:8787
 ```
 
-## Problems
+## Problems and Solutions
 
 ### Lock the Transmission image for 32 bit ARM hosts.
 
@@ -191,4 +190,12 @@ services:
     environment:
       - DNS_UPSTREAM_RESOLVER_TYPE=doh
       - DNS_UPSTREAM_RESOLVERS=cloudflare
+```
+
+### Fix Jellyfin bind mount ownership.
+
+If Jellyfin logs `Access to the path '/config/log' is denied`, make `data/jellyfin` writable by `APP_UID:APP_GID`:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" data/jellyfin
 ```
