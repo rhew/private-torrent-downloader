@@ -90,15 +90,27 @@ class CuratorRemoteClient:
                 "filename": filename,
                 "create_dir": create_dir,
             },
+            timeout=max(self.request_timeout, 300.0),
         )
 
     def get(self, path: str) -> dict[str, Any]:
         return self.request("GET", path)
 
-    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.request("POST", path, payload)
+    def post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return self.request("POST", path, payload, timeout=timeout)
 
-    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         headers = {"Accept": "application/json"}
         if data is not None:
@@ -112,7 +124,7 @@ class CuratorRemoteClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout or self.request_timeout) as response:
                 body = response.read()
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")

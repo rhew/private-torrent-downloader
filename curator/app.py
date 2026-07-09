@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from pathlib import Path
 import shutil
+import socket
 import subprocess
+import time
 from urllib.parse import urlparse
 
 from textual import work
@@ -788,10 +790,7 @@ class CuratorApp(App):
     def move_completed_torrent(self, torrent: dict, request: MoveRequest, create_dir: bool) -> None:
         try:
             if self.remote:
-                data = self.remote.move_completed_torrent(torrent, request.dest_dir, request.filename, create_dir)
-                torrents = list(data.get("torrents", []))
-                dest_dir = str(data.get("dest_dir") or request.dest_dir)
-                filename = str(data.get("filename") or request.filename)
+                torrents, dest_dir, filename = self.remote_move_completed_torrent(torrent, request, create_dir)
             else:
                 source_dir = torrent.get("downloadDir") or ""
                 source_name = torrent.get("name") or ""
@@ -831,6 +830,57 @@ class CuratorApp(App):
             dest_dir,
             filename,
         )
+
+    def remote_move_completed_torrent(
+        self,
+        torrent: dict,
+        request: MoveRequest,
+        create_dir: bool,
+    ) -> tuple[list[dict], str, str]:
+        assert self.remote is not None
+        try:
+            data = self.remote.move_completed_torrent(torrent, request.dest_dir, request.filename, create_dir)
+            return (
+                list(data.get("torrents", [])),
+                str(data.get("dest_dir") or request.dest_dir),
+                str(data.get("filename") or request.filename),
+            )
+        except Exception as error:
+            recovered = self.recover_timed_out_move(torrent, request, error)
+            if recovered is not None:
+                return recovered
+            raise
+
+    def recover_timed_out_move(
+        self,
+        torrent: dict,
+        request: MoveRequest,
+        error: Exception,
+    ) -> tuple[list[dict], str, str] | None:
+        if not self.is_timeout_error(error):
+            return None
+
+        torrent_id = torrent.get("id")
+        dest_local = self.local_dest_path(request.dest_dir) / request.filename
+        for _ in range(15):
+            if not dest_local.exists():
+                time.sleep(1)
+                continue
+            try:
+                torrents = self.remote.torrents() if self.remote else []
+            except Exception:
+                time.sleep(1)
+                continue
+            if any(item.get("id") == torrent_id for item in torrents):
+                time.sleep(1)
+                continue
+            return torrents, request.dest_dir, request.filename
+        return None
+
+    def is_timeout_error(self, error: Exception) -> bool:
+        if isinstance(error, (TimeoutError, socket.timeout)):
+            return True
+        return "timed out" in str(error).lower()
 
     def set_results(
         self,
@@ -1208,7 +1258,11 @@ def jackett_catalog_from_remote(data: dict) -> dict[str, JackettIndexer]:
 
 def format_percent(value) -> str:
     if isinstance(value, (int, float)):
-        return f"{value:.0%}"
+        if value >= 1:
+            return "100%"
+        if value > 0.99:
+            return "99%"
+        return f"{int(value * 100 + 0.5)}%"
     return "?"
 
 

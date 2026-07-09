@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
 import http.cookiejar
 import json
+import math
 import re
 import socket
 import urllib.error
@@ -75,8 +76,16 @@ def describe_torrent_status(torrent: dict) -> str:
         return "paused"
     percent_done = torrent.get("percentDone")
     if isinstance(percent_done, (int, float)):
-        return f"{percent_done:.0%}"
+        return format_percent_done(percent_done)
     return "active"
+
+
+def format_percent_done(value: float) -> str:
+    if value >= 1:
+        return "100%"
+    if value > 0.99:
+        return "99%"
+    return f"{math.floor(value * 100 + 0.5):.0f}%"
 
 
 def build_search_url(
