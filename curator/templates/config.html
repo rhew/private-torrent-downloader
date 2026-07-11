@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Curator Config{% endblock %}
+{% block content %}
+<section class="panel narrow">
+  <h1>Config</h1>
+  <dl class="config-list">
+    <dt>Config file</dt><dd>{{ config.config_path }}</dd>
+    <dt>Downloads root</dt><dd>{{ config.downloads_root }}</dd>
+    <dt>Library root</dt><dd>{{ config.library_root }}</dd>
+    <dt>Gluetun state</dt><dd>{{ config.gluetun_state_path }}</dd>
+    <dt>Jackett URL</dt><dd>{{ config.jackett_base_url }}</dd>
+    <dt>Transmission RPC</dt><dd>{{ config.transmission_rpc_url }}</dd>
+    <dt>Transmission GUI</dt><dd>{{ config.transmission_web_url }}</dd>
+    <dt>Network timeout</dt><dd>{{ config.timeout }}s</dd>
+  </dl>
+</section>
+
+<section class="panel narrow">
+  <h1>Media Types</h1>
+  {% for key, media in media_types.items() %}
+    <article class="media-config">
+      <h2>{{ media.label }}</h2>
+      <dl class="config-list">
+        <dt>Key</dt><dd>{{ key }}</dd>
+        <dt>Library dir</dt><dd>{{ media.library_dir }}</dd>
+        <dt>Indexers</dt><dd>{{ ", ".join(media.indexers) }}</dd>
+        <dt>Categories</dt><dd>{{ ", ".join(media.categories) or "Any" }}</dd>
+      </dl>
+    </article>
+  {% endfor %}
+</section>
+{% endblock %}

@@ -5,5 +5,5 @@ cd "$(dirname "$0")"
 
 ./vpngate.py
 docker compose stop transmission
-docker compose up -d --force-recreate gluetun
-docker compose up -d --force-recreate transmission
+docker compose restart gluetun
+docker compose up -d transmission

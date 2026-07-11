@@ -1,26 +1,35 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from datetime import timezone
+import hashlib
 import json
 import os
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 import shutil
+import threading
+import time
 from typing import Any
+from uuid import uuid4
+
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from .client import (
     JackettIndexer,
     SearchResult,
     TransmissionClient,
     build_torrent_add_arguments,
+    display_name,
     enable_indexer,
     fetch_indexers,
+    format_percent_done,
+    format_size,
     load_api_key,
     search_indexers,
 )
-from .config import MediaTypeConfig, ServerConfig, load_server_config
+from .config import CuratorConfig, MediaTypeConfig, load_config
 from .core import (
     desired_indexers_by_media,
     indexer_reconciliation_failure_count,
@@ -30,11 +39,70 @@ from .core import (
 )
 
 
+TORRENT_STATUS = {
+    0: "paused",
+    1: "check wait",
+    2: "checking",
+    3: "download wait",
+    4: "downloading",
+    5: "seed wait",
+    6: "seeding",
+}
+
+
+@dataclass
+class BackgroundJob:
+    id: str
+    label: str
+    status: str = "running"
+    message: str = ""
+    error: str = ""
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+class JobStore:
+    def __init__(self):
+        self.jobs: dict[str, BackgroundJob] = {}
+        self.lock = threading.Lock()
+
+    def start(self, label: str, target, *args) -> str:
+        job_id = uuid4().hex
+        with self.lock:
+            self.jobs[job_id] = BackgroundJob(id=job_id, label=label, message=f"{label} started.")
+        thread = threading.Thread(target=self._run, args=(job_id, target, args), daemon=True)
+        thread.start()
+        return job_id
+
+    def _run(self, job_id: str, target, args) -> None:
+        try:
+            message = target(*args)
+        except Exception as error:
+            with self.lock:
+                job = self.jobs[job_id]
+                job.status = "failed"
+                job.error = str(error)
+                job.message = f"{job.label} failed."
+            return
+        with self.lock:
+            job = self.jobs[job_id]
+            job.status = "complete"
+            job.message = str(message)
+
+    def get(self, job_id: str) -> BackgroundJob | None:
+        with self.lock:
+            return self.jobs.get(job_id)
+
+
 class CuratorService:
-    def __init__(self, config: ServerConfig):
+    def __init__(self, config: CuratorConfig):
         self.config = config
         self.api_key: str | None = None
         self.jackett_indexers: dict[str, JackettIndexer] = {}
+        self.indexer_report_lines: list[str] = []
+        self.indexer_failure_count = 0
+        self.indexer_enabled_count = 0
+        self.indexer_checking = False
+        self.indexer_error = ""
 
     def jackett_api_key(self) -> str:
         if self.api_key is None:
@@ -43,36 +111,40 @@ class CuratorService:
 
     def config_snapshot(self) -> dict[str, Any]:
         return {
+            "config_path": str(self.config.config_path),
             "downloads_root": str(self.config.downloads_root),
             "library_root": str(self.config.library_root),
+            "jackett_url": self.config.jackett_base_url,
             "transmission_url": self.config.transmission_rpc_url,
-            "max_timeout": self.config.timeout,
+            "transmission_web_url": self.config.transmission_web_url,
+            "gluetun_state_path": str(self.config.gluetun_state_path),
+            "timeout": self.config.timeout,
+            "default_media_type": self.config.default_media_type,
+            "default_sort": self.config.default_sort,
+            "media_types": self.config.media_types,
         }
 
-    def reconcile_indexers(
-        self,
-        media_types: dict[str, MediaTypeConfig],
-        requested_timeout: float | None = None,
-    ) -> dict[str, Any]:
-        desired = desired_indexers_by_media(media_types)
-        api_key = self.jackett_api_key()
-        timeout = self.effective_timeout(requested_timeout)
-        catalog = fetch_indexers(api_key, self.config.jackett_base_url, timeout)
-        catalog, enabled, failed = self.enable_missing_indexers(tuple(desired), catalog, timeout)
-        self.jackett_indexers = catalog
-        report_lines = indexer_reconciliation_report(desired, catalog, enabled, failed)
-        return {
-            "catalog": {key: asdict(value) for key, value in catalog.items()},
-            "report_lines": report_lines,
-            "enabled_count": len(enabled),
-            "failure_count": indexer_reconciliation_failure_count(desired, catalog, failed),
-        }
+    def reconcile_indexers(self) -> None:
+        self.indexer_checking = True
+        self.indexer_error = ""
+        desired = desired_indexers_by_media(self.config.media_types)
+        try:
+            catalog = fetch_indexers(self.jackett_api_key(), self.config.jackett_base_url, self.config.timeout)
+            catalog, enabled, failed = self.enable_missing_indexers(tuple(desired), catalog)
+            self.jackett_indexers = catalog
+            self.indexer_enabled_count = len(enabled)
+            self.indexer_failure_count = indexer_reconciliation_failure_count(desired, catalog, failed)
+            self.indexer_report_lines = indexer_reconciliation_report(desired, catalog, enabled, failed)
+        except Exception as error:
+            self.indexer_error = str(error)
+            raise
+        finally:
+            self.indexer_checking = False
 
     def enable_missing_indexers(
         self,
         indexers: tuple[str, ...],
         catalog: dict[str, JackettIndexer],
-        timeout: float,
     ) -> tuple[dict[str, JackettIndexer], list[str], dict[str, str]]:
         missing = [
             indexer
@@ -90,7 +162,7 @@ class CuratorService:
                     indexer,
                     self.config.jackett_base_url,
                     self.config.jackett_admin_password,
-                    timeout,
+                    self.config.timeout,
                 )
             except Exception as error:
                 errors[indexer] = str(error)
@@ -98,48 +170,29 @@ class CuratorService:
                 enabled.append(indexer)
 
         try:
-            catalog = fetch_indexers(self.jackett_api_key(), self.config.jackett_base_url, timeout)
+            catalog = fetch_indexers(self.jackett_api_key(), self.config.jackett_base_url, self.config.timeout)
         except Exception as error:
             errors["jackett"] = f"could not refresh indexer list: {error}"
-            return catalog, enabled, errors
-
         return catalog, enabled, errors
 
-    def search(
-        self,
-        media: MediaTypeConfig,
-        query: str,
-        requested_timeout: float | None = None,
-    ) -> dict[str, Any]:
-        api_key = self.jackett_api_key()
-        timeout = self.effective_timeout(requested_timeout)
-        catalog = self.jackett_indexers or fetch_indexers(
-            api_key,
-            self.config.jackett_base_url,
-            timeout,
-        )
-        self.jackett_indexers = catalog
+    def search(self, media: MediaTypeConfig, query: str) -> tuple[list[SearchResult], dict[str, str]]:
+        catalog = self.jackett_indexers
+        if not catalog:
+            catalog = fetch_indexers(self.jackett_api_key(), self.config.jackett_base_url, self.config.timeout)
+            self.jackett_indexers = catalog
         active_indexers, config_errors = usable_indexers(media.indexers, media.categories, catalog)
         if not active_indexers:
-            return {"results": [], "errors": config_errors}
+            return [], config_errors
 
         results, errors = search_indexers(
             query,
             active_indexers,
             media.categories,
-            api_key,
+            self.jackett_api_key(),
             self.config.jackett_base_url,
-            timeout,
+            self.config.timeout,
         )
-        return {
-            "results": [asdict(result) for result in results],
-            "errors": config_errors | errors,
-        }
-
-    def effective_timeout(self, requested_timeout: float | None) -> float:
-        if requested_timeout is None:
-            return self.config.timeout
-        return max(1.0, min(float(requested_timeout), self.config.timeout))
+        return results, config_errors | errors
 
     def add_download(self, result: SearchResult) -> dict[str, Any]:
         arguments = build_torrent_add_arguments(
@@ -148,16 +201,18 @@ class CuratorService:
             self.config.jackett_base_url,
             self.config.timeout,
         )
-        torrent = TransmissionClient(self.config.transmission_rpc_url).add_torrent(arguments)
-        return {"torrent": torrent}
+        return TransmissionClient(self.config.transmission_rpc_url).add_torrent(arguments)
 
-    def torrents(self) -> dict[str, Any]:
-        torrents = TransmissionClient(self.config.transmission_rpc_url).get_torrents()
-        return {"torrents": torrents}
+    def torrents(self) -> list[dict]:
+        return TransmissionClient(self.config.transmission_rpc_url).get_torrents()
 
-    def control_torrent(self, action: str, torrent_id: int | None) -> dict[str, Any]:
-        if torrent_id is None:
-            raise ValueError("torrent_id is required")
+    def torrent(self, torrent_id: int) -> dict:
+        for torrent in self.torrents():
+            if torrent.get("id") == torrent_id:
+                return torrent
+        raise KeyError(f"torrent {torrent_id} not found")
+
+    def control_torrent(self, action: str, torrent_id: int) -> None:
         client = TransmissionClient(self.config.transmission_rpc_url)
         if action == "start":
             client.start_torrents([torrent_id])
@@ -167,20 +222,15 @@ class CuratorService:
             client.remove_torrents([torrent_id], delete_local_data=True)
         else:
             raise ValueError(f"unsupported torrent action: {action}")
-        return {"torrents": client.get_torrents()}
 
     def move_suggestion(self, media: MediaTypeConfig, torrent: dict) -> dict[str, Any]:
-        source_name = torrent.get("name") or ""
         suggestion = suggest_move_target(
             media_key=media.key,
-            library_dir=media.library_dir,
-            source_name=source_name,
+            library_dir=self.local_dest_path(str(media.library_dir)),
+            source_name=torrent.get("name") or "",
             source_is_dir=self.torrent_source_is_dir(torrent),
         )
         return asdict(suggestion)
-
-    def path_exists(self, path_text: str) -> dict[str, Any]:
-        return {"exists": self.local_dest_path(path_text).exists()}
 
     def move_completed_torrent(
         self,
@@ -188,7 +238,7 @@ class CuratorService:
         dest_dir: str,
         filename: str,
         create_dir: bool,
-    ) -> dict[str, Any]:
+    ) -> str:
         source_dir = torrent.get("downloadDir") or ""
         source_name = torrent.get("name") or ""
         if not source_dir or not source_name:
@@ -211,9 +261,11 @@ class CuratorService:
             raise FileExistsError(f"destination already exists: {dest_local}")
 
         shutil.move(str(source_local), str(dest_local))
-        client = TransmissionClient(self.config.transmission_rpc_url)
-        client.remove_torrents([torrent.get("id")], delete_local_data=False)
-        return {"torrents": client.get_torrents(), "dest_dir": dest_dir, "filename": filename}
+        TransmissionClient(self.config.transmission_rpc_url).remove_torrents(
+            [torrent.get("id")],
+            delete_local_data=False,
+        )
+        return f"Archived to {dest_dir.rstrip('/')}/{filename} and removed from Transmission."
 
     def transmission_path_to_local(self, transmission_path: str) -> Path:
         path = PurePosixPath(transmission_path)
@@ -242,173 +294,557 @@ class CuratorService:
             return source_local.is_dir()
         return Path(source_name).suffix == ""
 
+    def indexer_summary(self) -> dict[str, Any]:
+        if self.indexer_checking:
+            return {"state": "checking", "message": "Checking configured Jackett indexers...", "details": []}
+        if self.indexer_error and not self.jackett_indexers:
+            return {"state": "warning", "message": f"Indexer check failed: {self.indexer_error}", "details": []}
+        if not self.jackett_indexers:
+            return {"state": "unchecked", "message": "Indexers have not been checked yet.", "details": []}
+        if self.indexer_failure_count:
+            return {
+                "state": "warning",
+                "message": f"Indexer check found {self.indexer_failure_count} issue(s).",
+                "details": self.indexer_report_lines,
+            }
+        if self.indexer_enabled_count:
+            return {
+                "state": "ready",
+                "message": f"Indexers ready. Enabled {self.indexer_enabled_count}.",
+                "details": self.indexer_report_lines,
+            }
+        return {"state": "ready", "message": "Indexers ready.", "details": self.indexer_report_lines}
 
-class CuratorRequestHandler(BaseHTTPRequestHandler):
-    server: CuratorHTTPServer
 
-    def do_GET(self) -> None:
-        if not self.authenticate():
-            return
+def create_app(config: CuratorConfig) -> Flask:
+    app = Flask(__name__)
+    app.jinja_env.filters["display_name"] = display_name
+    app.jinja_env.filters["torrent_view"] = torrent_view
+    service = CuratorService(config)
+    jobs = JobStore()
+    start_indexer_check(service)
+    start_config_watch(service)
+
+    @app.get("/")
+    def index():
+        return render_template(
+            "index.html",
+            **dashboard_context(
+                service,
+                selected_media_key(service.config, request.args.get("media_key")),
+                query=request.args.get("query", ""),
+                results=[],
+                errors={},
+                status=request.args.get("status", ""),
+                error=request.args.get("error", ""),
+                job_id=request.args.get("job", ""),
+            ),
+        )
+
+    @app.post("/search")
+    def search():
+        media_key = selected_media_key(service.config, request.form.get("media_key"))
+        query = str(request.form.get("query") or "").strip()
+        if not query:
+            return render_template(
+                "index.html",
+                **dashboard_context(
+                    service,
+                    media_key,
+                    query="",
+                    results=[],
+                    errors={},
+                    status="",
+                    error="Enter a search term.",
+                    job_id="",
+                ),
+            )
         try:
-            if self.path == "/api/health":
-                self.write_json({"ok": True})
-            elif self.path == "/api/config":
-                self.write_json(self.server.service.config_snapshot())
-            elif self.path == "/api/torrents":
-                self.write_json(self.server.service.torrents())
-            else:
-                self.write_error(HTTPStatus.NOT_FOUND, "not found")
+            results, errors = service.search(service.config.media_types[media_key], query)
+            status = f"Search complete: {len(results)} result(s)."
+            if errors:
+                status = f"Search complete: {len(results)} result(s), {len(errors)} indexer issue(s)."
         except Exception as error:
-            self.write_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(error))
+            results = []
+            errors = {}
+            status = ""
+            error_message = f"Search failed: {error}"
+        else:
+            error_message = ""
+        return render_template(
+            "index.html",
+            **dashboard_context(
+                service,
+                media_key,
+                query=query,
+                results=results,
+                errors=errors,
+                status=status,
+                error=error_message,
+                job_id="",
+            ),
+        )
 
-    def do_POST(self) -> None:
-        if not self.authenticate():
-            return
+    @app.post("/downloads/add")
+    def add_download():
+        media_key = selected_media_key(service.config, request.form.get("media_key"))
+        query = str(request.form.get("query") or "").strip()
+        result = search_result_from_form(request.form)
         try:
-            payload = self.read_json()
-            if self.path == "/api/indexers/reconcile":
-                self.write_json(
-                    self.server.service.reconcile_indexers(
-                        media_types_from_dict(payload["media_types"]),
-                        optional_timeout(payload.get("timeout")),
-                    )
-                )
-            elif self.path == "/api/search":
-                self.write_json(
-                    self.server.service.search(
-                        media_type_from_dict(payload["media"]),
-                        str(payload["query"]),
-                        optional_timeout(payload.get("timeout")),
-                    )
-                )
-            elif self.path == "/api/downloads/add":
-                self.write_json(self.server.service.add_download(search_result_from_dict(payload["result"])))
-            elif self.path == "/api/torrents/control":
-                self.write_json(
-                    self.server.service.control_torrent(
-                        str(payload["action"]),
-                        payload.get("torrent_id"),
-                    )
-                )
-            elif self.path == "/api/move/suggest":
-                self.write_json(
-                    self.server.service.move_suggestion(
-                        media_type_from_dict(payload["media"]),
-                        payload["torrent"],
-                    )
-                )
-            elif self.path == "/api/path/exists":
-                self.write_json(self.server.service.path_exists(str(payload["path"])))
-            elif self.path == "/api/torrents/move":
-                self.write_json(
-                    self.server.service.move_completed_torrent(
-                        payload["torrent"],
-                        str(payload["dest_dir"]),
-                        str(payload["filename"]),
-                        bool(payload.get("create_dir")),
-                    )
-                )
-            else:
-                self.write_error(HTTPStatus.NOT_FOUND, "not found")
-        except KeyError as error:
-            self.write_error(HTTPStatus.BAD_REQUEST, f"missing field: {error}")
+            torrent = service.add_download(result)
         except Exception as error:
-            self.write_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(error))
+            return render_dashboard_with_optional_search(
+                service,
+                media_key,
+                query,
+                status="",
+                error=f"Transmission add failed: {error}",
+            )
+        name = torrent.get("name") or result.title
+        return render_dashboard_with_optional_search(
+            service,
+            media_key,
+            query,
+            status=f"Added to Transmission: {name}",
+            error="",
+        )
 
-    def authenticate(self) -> bool:
-        token = self.server.token
-        if not token:
-            return True
-        expected = f"Bearer {token}"
-        if self.headers.get("Authorization") == expected:
-            return True
-        self.write_error(HTTPStatus.UNAUTHORIZED, "unauthorized")
-        return False
+    @app.post("/torrents/<int:torrent_id>/<action>")
+    def control_torrent(torrent_id: int, action: str):
+        media_key = selected_media_key(service.config, request.form.get("media_key"))
+        query = str(request.form.get("query") or "").strip()
+        wants_json = "application/json" in request.headers.get("Accept", "")
+        try:
+            service.control_torrent(action, torrent_id)
+        except Exception as error:
+            if wants_json:
+                return jsonify({"error": f"Transmission control failed: {error}"}), 500
+            return render_dashboard_with_optional_search(
+                service,
+                media_key,
+                query,
+                status="",
+                error=f"Transmission control failed: {error}",
+            )
+        messages = {
+            "start": "Torrent resumed.",
+            "stop": "Torrent paused.",
+            "remove_destroy": "Torrent removed and local data deleted.",
+        }
+        message = messages.get(action, "Torrent updated.")
+        if wants_json:
+            return jsonify({"status": message})
+        return render_dashboard_with_optional_search(
+            service,
+            media_key,
+            query,
+            status=message,
+            error="",
+        )
 
-    def read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or "0")
-        if not length:
-            return {}
-        payload = self.rfile.read(length)
-        return json.loads(payload.decode("utf-8"))
+    @app.get("/torrents/<int:torrent_id>/move")
+    def move_form(torrent_id: int):
+        media_key = selected_media_key(service.config, request.args.get("media_key"))
+        try:
+            torrent = service.torrent(torrent_id)
+            ensure_complete(torrent)
+            suggestion = service.move_suggestion(service.config.media_types[media_key], torrent)
+            dest_exists = service.local_dest_path(suggestion["dest_dir"]).exists()
+        except Exception as error:
+            return redirect(url_for("index", media_key=media_key, error=f"Move setup failed: {error}"))
+        return render_template(
+            "move.html",
+            config=service.config,
+            media_key=media_key,
+            media=service.config.media_types[media_key],
+            torrent=torrent,
+            suggestion=suggestion,
+            dest_exists=dest_exists,
+            error="",
+        )
 
-    def write_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    @app.post("/torrents/<int:torrent_id>/move")
+    def move_torrent(torrent_id: int):
+        media_key = selected_media_key(service.config, request.form.get("media_key"))
+        dest_dir = str(request.form.get("dest_dir") or "").strip()
+        filename = str(request.form.get("filename") or "").strip()
+        create_dir = request.form.get("create_dir") == "on"
+        try:
+            torrent = service.torrent(torrent_id)
+            ensure_complete(torrent)
+            if not dest_dir or not filename:
+                raise ValueError("destination directory and filename are required")
+            dest_exists = service.local_dest_path(dest_dir).exists()
+            if not dest_exists and not create_dir:
+                suggestion = {"dest_dir": dest_dir, "filename": filename, "message": "Destination directory does not exist."}
+                return render_template(
+                    "move.html",
+                    config=service.config,
+                    media_key=media_key,
+                    media=service.config.media_types[media_key],
+                    torrent=torrent,
+                    suggestion=suggestion,
+                    dest_exists=False,
+                    error="Check create directory to archive to this destination.",
+                )
+        except Exception as error:
+            return redirect(url_for("index", media_key=media_key, error=f"Move setup failed: {error}"))
 
-    def write_error(self, status: HTTPStatus, message: str) -> None:
-        self.write_json({"error": message}, status=status)
+        job_id = jobs.start(
+            f"Move {torrent.get('name') or torrent_id}",
+            service.move_completed_torrent,
+            torrent,
+            dest_dir,
+            filename,
+            create_dir,
+        )
+        return redirect(url_for("index", media_key=media_key, job=job_id, status="Move started."))
 
-    def log_message(self, format: str, *args) -> None:
-        print(f"{self.address_string()} - {format % args}")
+    @app.get("/config")
+    def config_page():
+        media_key = selected_media_key(service.config, request.args.get("media_key"))
+        return render_template(
+            "config.html",
+            config=service.config,
+            media_key=media_key,
+            media_types=service.config.media_types,
+            page_class="config-page",
+        )
+
+    @app.get("/api/torrents")
+    def api_torrents():
+        try:
+            torrents = service.torrents()
+        except Exception as error:
+            return jsonify({"error": str(error)}), 500
+        return jsonify({"torrents": [torrent_view(torrent) for torrent in torrents]})
+
+    @app.get("/api/jobs/<job_id>")
+    def api_job(job_id: str):
+        job = jobs.get(job_id)
+        if job is None:
+            return jsonify({"error": "job not found"}), 404
+        payload = asdict(job)
+        payload["created_at"] = job.created_at.isoformat()
+        return jsonify(payload)
+
+    return app
 
 
-class CuratorHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address, handler_class, service: CuratorService, token: str):
-        super().__init__(server_address, handler_class)
-        self.service = service
-        self.token = token
-
-
-def search_result_from_dict(data: dict[str, Any]) -> SearchResult:
-    return SearchResult(
-        indexer=str(data["indexer"]),
-        title=str(data["title"]),
-        size=str(data.get("size") or "?"),
-        size_bytes=int(data.get("size_bytes") or 0),
-        seeders=str(data.get("seeders") or "?"),
-        leechers=str(data.get("leechers") or "?"),
-        categories=tuple(str(item) for item in data.get("categories", ())),
-        guid=str(data.get("guid") or ""),
-        link=str(data.get("link") or ""),
-    )
-
-
-def media_types_from_dict(data: dict[str, Any]) -> dict[str, MediaTypeConfig]:
+def base_context(service: CuratorService, media_key: str) -> dict[str, Any]:
+    try:
+        torrents = service.torrents()
+        torrent_error = ""
+    except Exception as error:
+        torrents = []
+        torrent_error = f"Transmission progress failed: {error}"
     return {
-        str(key): media_type_from_dict(value)
-        for key, value in data.items()
+        "config": service.config,
+        "media_key": media_key,
+        "media": service.config.media_types[media_key],
+        "media_types": service.config.media_types,
+        "torrents": torrents,
+        "torrent_error": torrent_error,
+        "indexer_summary": service.indexer_summary(),
     }
 
 
-def media_type_from_dict(data: dict[str, Any]) -> MediaTypeConfig:
-    return MediaTypeConfig(
-        key=str(data["key"]),
-        label=str(data.get("label") or data["key"]),
-        indexers=tuple(str(item) for item in data.get("indexers", ())),
-        categories=tuple(str(item) for item in data.get("categories", ())),
-        library_dir=Path(str(data.get("library_dir") or data["key"])),
+def dashboard_context(
+    service: CuratorService,
+    media_key: str,
+    query: str,
+    results: list[SearchResult],
+    errors: dict[str, str],
+    status: str,
+    error: str,
+    job_id: str,
+) -> dict[str, Any]:
+    context = base_context(service, media_key)
+    context.update(
+        {
+            "query": query,
+            "results": results,
+            "errors": errors,
+            "overview": system_overview(service, context["torrents"], context["torrent_error"]),
+            "status": status,
+            "error": error,
+            "job_id": job_id,
+            "page_class": "dashboard-page",
+        }
+    )
+    return context
+
+
+def render_dashboard_with_optional_search(
+    service: CuratorService,
+    media_key: str,
+    query: str,
+    status: str,
+    error: str,
+):
+    results: list[SearchResult] = []
+    errors: dict[str, str] = {}
+    if query:
+        try:
+            results, errors = service.search(service.config.media_types[media_key], query)
+        except Exception as search_error:
+            error = f"{error} Search refresh failed: {search_error}".strip()
+    return render_template(
+        "index.html",
+        **dashboard_context(
+            service,
+            media_key,
+            query=query,
+            results=results,
+            errors=errors,
+            status=status,
+            error=error,
+            job_id="",
+        ),
     )
 
 
-def optional_timeout(value: Any) -> float | None:
-    if value is None:
-        return None
+def start_indexer_check(service: CuratorService) -> None:
+    thread = threading.Thread(target=run_startup_indexer_check, args=(service,), daemon=True)
+    thread.start()
+
+
+def run_startup_indexer_check(service: CuratorService) -> None:
+    delays = (2, 5, 10, 20, 30, 60)
+    for attempt in range(len(delays) + 1):
+        try:
+            service.reconcile_indexers()
+            if attempt:
+                print("Curator indexer check succeeded after retry.", flush=True)
+            return
+        except Exception as error:
+            print(f"Curator indexer check failed: {error}", flush=True)
+            if attempt == len(delays):
+                return
+            time.sleep(delays[attempt])
+
+
+def start_config_watch(service: CuratorService) -> None:
+    thread = threading.Thread(target=watch_config_file, args=(service,), daemon=True)
+    thread.start()
+
+
+def watch_config_file(service: CuratorService, interval: int = 10) -> None:
+    config_path = service.config.config_path
+    current_digest = file_digest(config_path)
+    while True:
+        time.sleep(interval)
+        next_digest = file_digest(config_path)
+        if not next_digest or next_digest == current_digest:
+            continue
+        try:
+            next_config = load_config(config_path)
+        except Exception as error:
+            service.indexer_error = f"Config reload failed: {error}"
+            print(f"Curator config reload failed: {error}", flush=True)
+            continue
+        current_digest = next_digest
+        service.config = next_config
+        service.api_key = None
+        service.jackett_indexers = {}
+        print(f"Curator config reloaded from {config_path}", flush=True)
+        try:
+            service.reconcile_indexers()
+        except Exception as error:
+            print(f"Curator indexer check failed after config reload: {error}", flush=True)
+
+
+def file_digest(path: Path) -> str:
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid timeout: {value!r}") from None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return ""
+
+
+def selected_media_key(config: CuratorConfig, value: str | None) -> str:
+    if value in config.media_types:
+        return str(value)
+    return config.default_media_type
+
+
+def ensure_complete(torrent: dict) -> None:
+    if torrent_is_complete(torrent):
+        return
+    raise RuntimeError("selected torrent is not complete")
+
+
+def search_result_from_form(form) -> SearchResult:
+    return SearchResult(
+        indexer=str(form["indexer"]),
+        title=str(form["title"]),
+        size=str(form.get("size") or "?"),
+        size_bytes=int(form.get("size_bytes") or 0),
+        seeders=str(form.get("seeders") or "?"),
+        leechers=str(form.get("leechers") or "?"),
+        categories=tuple(item for item in str(form.get("categories") or "").split(",") if item),
+        guid=str(form.get("guid") or ""),
+        link=str(form.get("link") or ""),
+    )
+
+
+def torrent_view(torrent: dict) -> dict[str, Any]:
+    return {
+        "id": torrent.get("id"),
+        "name": torrent.get("name") or "",
+        "state": TORRENT_STATUS.get(torrent.get("status"), str(torrent.get("status"))),
+        "size": format_size(torrent.get("totalSize")),
+        "progress": format_percent(torrent.get("percentDone")),
+        "eta": format_eta(torrent.get("eta")),
+        "download_rate": format_rate(torrent.get("rateDownload")),
+        "peers": format_peers(torrent),
+        "complete": torrent_is_complete(torrent),
+        "paused": torrent.get("status") == 0,
+    }
+
+
+def torrent_is_complete(torrent: dict) -> bool:
+    percent_done = torrent.get("percentDone")
+    if isinstance(percent_done, (int, float)):
+        return percent_done >= 1
+    total_size = torrent.get("totalSize")
+    return torrent.get("leftUntilDone") == 0 and isinstance(total_size, int) and total_size > 0
+
+
+def format_percent(value) -> str:
+    if isinstance(value, (int, float)):
+        return format_percent_done(float(value))
+    return "?"
+
+
+def format_eta(value) -> str:
+    if not isinstance(value, int) or value < 0:
+        return "?"
+    hours, remainder = divmod(value, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def format_rate(value) -> str:
+    if not isinstance(value, int):
+        return "?"
+    if value <= 0:
+        return "0"
+    size = float(value)
+    for unit in ("B/s", "KiB/s", "MiB/s", "GiB/s"):
+        if size < 1024 or unit == "GiB/s":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return "?"
+
+
+def format_peers(torrent: dict) -> str:
+    active = torrent.get("peersSendingToUs")
+    connected = torrent.get("peersConnected")
+    if isinstance(active, int) and isinstance(connected, int):
+        return f"{active}/{connected}"
+    if isinstance(connected, int):
+        return str(connected)
+    return "?"
+
+
+def system_overview(service: CuratorService, torrents: list[dict], torrent_error: str = "") -> dict[str, Any]:
+    return {
+        "downloads": disk_usage_view("Downloads", service.config.downloads_root),
+        "library": disk_usage_view("Library", service.config.library_root),
+        "jackett": jackett_status(service),
+        "transmission": transmission_status(torrents, torrent_error),
+        "gluetun": gluetun_status(service.config.gluetun_state_path),
+    }
+
+
+def disk_usage_view(label: str, path: Path) -> dict[str, str]:
+    try:
+        usage = shutil.disk_usage(path)
+    except Exception as error:
+        return {"label": label, "path": str(path), "state": "warning", "summary": f"Unavailable: {error}"}
+    used = usage.total - usage.free
+    percent = int((used / usage.total) * 100) if usage.total else 0
+    return {
+        "label": label,
+        "path": str(path),
+        "state": "ready" if percent < 90 else "warning",
+        "summary": f"{format_size(usage.free)} free of {format_size(usage.total)}",
+        "percent": f"{percent}%",
+    }
+
+
+def jackett_status(service: CuratorService) -> dict[str, str]:
+    summary = service.indexer_summary()
+    return {"state": summary["state"], "summary": summary["message"]}
+
+
+def transmission_status(torrents: list[dict], torrent_error: str = "") -> dict[str, str]:
+    if torrent_error:
+        return {"state": "warning", "summary": torrent_error}
+    active = sum(1 for torrent in torrents if torrent.get("status") == 4)
+    return {"state": "ready", "summary": f"{len(torrents)} torrent(s), {active} downloading"}
+
+
+def gluetun_status(state_path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"state": "warning", "summary": f"VPN state file not found: {state_path}"}
+    except Exception as error:
+        return {"state": "warning", "summary": f"VPN state unavailable: {error}"}
+
+    location = data.get("country_short") or data.get("country_long") or "unknown"
+    host = data.get("host_name") or data.get("ip") or "unknown host"
+    generated_at = data.get("generated_at") or "unknown refresh time"
+    return {
+        "state": "ready",
+        "summary": f"{location} via {host}",
+        "detail": f"Last VPNGate refresh: {humanize_timestamp(generated_at)}",
+    }
+
+
+def humanize_timestamp(value: str) -> str:
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except Exception:
+        return str(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    delta = now - timestamp.astimezone(timezone.utc)
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    days = hours // 24
+    return f"{days} day{'s' if days != 1 else ''} ago"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Curator HTTP server.")
-    parser.add_argument("--config", type=Path, default=Path("curator/server.toml"))
+    parser = argparse.ArgumentParser(description="Curator web server.")
+    parser.add_argument("--config", type=Path, default=Path("curator-config/curator.toml"))
     parser.add_argument("--host", default=os.environ.get("CURATOR_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CURATOR_PORT", "8787")))
-    parser.add_argument("--token", default=os.environ.get("CURATOR_TOKEN", ""))
+    parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    service = CuratorService(load_server_config(args.config))
-    server = CuratorHTTPServer((args.host, args.port), CuratorRequestHandler, service, args.token)
-    print(f"Curator server listening on http://{args.host}:{args.port}")
-    server.serve_forever()
+    app = create_app(load_config(args.config))
+    print(f"Curator web listening on http://{args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, debug=args.debug)
 
 
 if __name__ == "__main__":

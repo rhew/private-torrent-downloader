@@ -25,7 +25,7 @@ def usable_indexers(
     for indexer_id in indexers:
         indexer = catalog.get(indexer_id)
         if indexer is None:
-            errors[indexer_id] = "not found in Jackett"
+            errors[indexer_id] = "not found in Jackett; check the exact Jackett definition id in curator.toml"
             continue
         if not indexer.configured:
             errors[indexer_id] = "not configured in Jackett"

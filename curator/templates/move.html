@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Move Torrent{% endblock %}
+{% block content %}
+<section class="panel narrow">
+  <h1>Move Completed Torrent</h1>
+  <p class="muted">{{ torrent.name }}</p>
+  {% if suggestion.message %}
+    <div class="notice">{{ suggestion.message }}</div>
+  {% endif %}
+  {% if error %}
+    <div class="notice error">{{ error }}</div>
+  {% endif %}
+  <form class="stack-form" action="{{ url_for('move_torrent', torrent_id=torrent.id) }}" method="post">
+    <input type="hidden" name="media_key" value="{{ media_key }}">
+    <label>
+      <span>Destination directory</span>
+      <input name="dest_dir" value="{{ suggestion.dest_dir }}" required>
+    </label>
+    <label>
+      <span>Final name</span>
+      <input name="filename" value="{{ suggestion.filename }}" required>
+    </label>
+    {% if not dest_exists %}
+      <label class="checkbox-row">
+        <input type="checkbox" name="create_dir">
+        <span>Create destination directory</span>
+      </label>
+    {% endif %}
+    <div class="button-row">
+      <button type="submit">Start move</button>
+      <a class="button secondary" href="{{ url_for('index', media_key=media_key) }}">Cancel</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

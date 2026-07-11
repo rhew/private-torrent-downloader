@@ -4,7 +4,7 @@ Three pieces:
 
 1. A script to select a VPN from VPN Gate
 2. A Compose file to create the VPN with GlueTun, run Transmission, run Jackett, and run Jellyfin.
-3. A `curator` TUI and optional Curator server. The server owns Jackett, Transmission, and filesystem operations; the TUI can run locally against that server from another machine.
+3. A `curator` web app. Curator owns Jackett, Transmission, and filesystem operations from one server-side UI.
 
 ## Media File Layout
 
@@ -68,33 +68,26 @@ RENDER_GID=992
 ### Make the local data directories, or update `.env` to point to existing storage.
 
 ```
-mkdir -p downloads library data/jellyfin/config data/jellyfin/cache gluetun
+mkdir -p downloads library data/jellyfin/config data/jellyfin/cache gluetun curator-config
 ```
 
 The directories mounted into containers must be writable by `APP_UID:APP_GID`. This matters for `downloads/`, `library/`, `jackett-config/`, and `data/jellyfin/`.
 
-### Configure the Curator client
+### Configure Curator
 
-Start from the client example config on the machine where you run the TUI:
+Start from the example config on the machine where Docker runs:
 
 ```bash
-cp curator/client.example.toml curator/client.toml
+cp curator-config/curator.example.toml curator-config/curator.toml
 ```
 
-Set the Curator server URL:
+Set the paths and service URLs for the host or container where Curator runs. `network.timeout` controls how long Curator waits for Jackett and Transmission calls.
 
-```toml
-[curator]
-server_url = "http://127.0.0.1:8787"
-request_timeout = 25
-```
-
-- `curator.request_timeout` is how long the client will wait for the Curator server to answer.
-- `network.timeout` is how long the client is asking the server to spend on Jackett/indexer work.
+When running with Docker Compose, `curator-config/` is mounted as a read-only config directory and Curator reads `/app/config/curator.toml`. This lets Curator notice editors that save `curator.toml` by atomically replacing the file without exposing the application source tree as config.
 
 #### Add one or more media types
 
-Add a `[media_types.<name>]` section to `curator/client.toml`. For example:
+Add a `[media_types.<name>]` section to `curator-config/curator.toml`. For example:
 
 ```toml
 [media_types.isos]
@@ -105,20 +98,16 @@ categories = [4020]
 ```
 
 - `label` is the name UI will use for the media type.
-- `library_dir` is where `m` archives completed downloads by default. Relative paths are resolved by the server under its configured library root.
-- `indexers` are the Jackett indexer ids Curator will query. Look at the [indexer definition files for Jackett](https://github.com/Jackett/Jackett/tree/master/src/Jackett.Common/Definitions). The token you put in `curator/client.toml` is the definition filename without the `.yml` suffix.
+- `library_dir` is where Curator archives completed downloads by default. Relative paths are resolved under `paths.library_root`.
+- `indexers` are the Jackett indexer ids Curator will query. Look at the [indexer definition files for Jackett](https://github.com/Jackett/Jackett/tree/master/src/Jackett.Common/Definitions). The id is the definition filename without the `.yml` suffix.
 - `categories` are numeric Jackett/Torznab category ids. See the [Jackett Categories Wiki](https://github.com/Jackett/Jackett/wiki/Jackett-Categories). Examples:
   - `2000` = `Movies`
   - `2040` = `Movies/HD`
   - `4020` = `PC/ISO`
-
-### Configure the Curator server
-
-Start from the server example config on the machine where Docker runs:
-
-```bash
-cp curator/server.example.toml curator/server.toml
-```
+- `paths.gluetun_state_path` lets Curator show the last VPNGate refresh in the dashboard overview.
+- `transmission.web_url` is the browser link Curator uses for the Transmission GUI.
+- `ui.default_media_type` selects the initial media type.
+- `ui.default_sort` selects the initial result sort.
 
 ## Run
 
@@ -130,15 +119,17 @@ python3 vpngate.py
 
 This writes `gluetun/vpngate.ovpn` and `gluetun/vpngate-state.json`.
 
-### Start Transmission, GlueTun, Jackett, Curator server, and Jellyfin.
+### Start Transmission, GlueTun, Jackett, Curator, and Jellyfin.
 
-```
+```bash
 docker compose up -d
 ```
 
+Open Curator at `http://localhost:8787`, or replace `localhost` with the Docker host name when accessing it remotely.
+
 ### Refresh the VPNGate endpoint and recreate the VPN/transmission stack
 
-```
+```bash
 ./vpn-refresh
 ```
 
@@ -157,17 +148,11 @@ Dashboard -> Playback -> Transcoding
 
 Enable hardware acceleration and select the Intel VA-API / Quick Sync option that Jellyfin offers for `/dev/dri`.
 
-### Start the Curator TUI
+### Run Curator locally without Docker
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m curator
-```
-
-`python3 -m curator` uses `server_url` from `curator/client.toml`. You can override it from the command line:
-
-```bash
-python3 -m curator --server-url http://127.0.0.1:8787
+python3 -m curator --config curator-config/curator.toml --host 127.0.0.1 --port 8787
 ```
 
 ## Problems and Solutions

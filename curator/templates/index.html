@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+{% block title %}Curator Dashboard{% endblock %}
+{% block content %}
+<section class="toolbar">
+  <form class="search-form" action="{{ url_for('search') }}" method="post">
+    <label>
+      <span>Media</span>
+      <select name="media_key">
+        {% for key, item in media_types.items() %}
+          <option value="{{ key }}" {% if key == media_key %}selected{% endif %}>{{ item.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="search-field">
+      <span>Search</span>
+      <input name="query" value="{{ query }}" placeholder="Search {{ media.label.lower() }}">
+    </label>
+    <button type="submit" data-busy-label="Searching...">Search</button>
+  </form>
+</section>
+
+<div class="visible-status">
+  {{ status or indexer_summary.message }}
+</div>
+
+<details class="status-drop">
+  <summary>
+    <span>System</span>
+    <span class="summary-hint">open for services, storage, and config</span>
+  </summary>
+  <div class="status-content">
+    {% if error %}
+      <div class="notice error">{{ error }}</div>
+    {% endif %}
+    {% if torrent_error %}
+      <div class="notice error">{{ torrent_error }}</div>
+    {% endif %}
+    {% if job_id %}
+      <div class="notice" id="job-status" data-job-id="{{ job_id }}">Move is running...</div>
+    {% endif %}
+    <section class="system-section">
+      <h2>Filesystem</h2>
+      <div class="overview-grid">
+        <article class="overview-card {{ overview.downloads.state }}">
+          <span>Downloads</span>
+          <strong>{{ overview.downloads.summary }}</strong>
+          <small>{{ overview.downloads.path }}</small>
+        </article>
+        <article class="overview-card {{ overview.library.state }}">
+          <span>Library</span>
+          <strong>{{ overview.library.summary }}</strong>
+          <small>{{ overview.library.path }}</small>
+        </article>
+      </div>
+    </section>
+
+    <section class="system-section">
+      <h2>Services</h2>
+      <div class="overview-grid">
+        <article class="overview-card {{ overview.transmission.state }}">
+          <span>Transmission</span>
+          <strong>{{ overview.transmission.summary }}</strong>
+          <small><a class="text-link" href="{{ config.transmission_web_url }}" target="_blank" rel="noreferrer">Open Transmission GUI</a></small>
+        </article>
+        <article class="overview-card {{ overview.jackett.state }}">
+          <span>Jackett</span>
+          <strong>{{ indexer_summary.message }}</strong>
+          {% if indexer_summary.details %}
+            <details class="nested-details">
+              <summary>Indexer details</summary>
+              <pre>{{ "\n".join(indexer_summary.details) }}</pre>
+            </details>
+          {% endif %}
+        </article>
+        <article class="overview-card {{ overview.gluetun.state }}">
+          <span>Gluetun</span>
+          <strong>{{ overview.gluetun.summary }}</strong>
+          <small>{{ overview.gluetun.detail or "" }}</small>
+        </article>
+      </div>
+    </section>
+
+    <section class="system-section config-summary">
+      <strong>Config</strong>
+      <dl class="config-list compact">
+        <dt>Config file</dt><dd>{{ config.config_path }}</dd>
+        <dt>Downloads root</dt><dd>{{ config.downloads_root }}</dd>
+        <dt>Library root</dt><dd>{{ config.library_root }}</dd>
+        <dt>Jackett URL</dt><dd>{{ config.jackett_base_url }}</dd>
+        <dt>Transmission RPC</dt><dd>{{ config.transmission_rpc_url }}</dd>
+        <dt>Transmission GUI</dt><dd><a class="text-link" href="{{ config.transmission_web_url }}" target="_blank" rel="noreferrer">{{ config.transmission_web_url }}</a></dd>
+        <dt>Gluetun state</dt><dd>{{ config.gluetun_state_path }}</dd>
+        <dt>Media types</dt><dd>{{ media_types.values()|map(attribute="label")|join(", ") }}</dd>
+      </dl>
+    </section>
+
+    {% if errors %}
+      <section class="notice warning">
+        <strong>Search issues</strong>
+        <ul>
+          {% for indexer, message in errors.items() %}
+            <li>{{ indexer|display_name }}: {{ message }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+  </div>
+</details>
+
+<section class="dashboard-grid">
+  <section class="panel pane results-pane">
+    <div class="panel-heading">
+      <h1>Results</h1>
+      <span class="muted">Click a column heading to sort</span>
+    </div>
+    <div class="table-wrap">
+      <table id="results-table" data-default-sort="{{ config.default_sort }}">
+        <thead>
+          <tr>
+            <th><button class="sort-header" type="button" data-sort="seeders">Seed</button></th>
+            <th><button class="sort-header" type="button" data-sort="leechers">Leech</button></th>
+            <th><button class="sort-header" type="button" data-sort="size">Size</button></th>
+            <th><button class="sort-header" type="button" data-sort="indexer">Indexer</button></th>
+            <th><button class="sort-header" type="button" data-sort="title">Title</button></th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for result in results %}
+            <tr
+              data-seeders="{{ result.seeders_value }}"
+              data-leechers="{{ result.leechers_value }}"
+              data-size="{{ result.size_bytes }}"
+              data-indexer="{{ result.indexer }}"
+              data-title="{{ result.title.lower() }}"
+            >
+              <td>{{ result.seeders }}</td>
+              <td>{{ result.leechers }}</td>
+              <td>{{ result.size }}</td>
+              <td>{{ result.indexer|display_name }}</td>
+              <td class="title-cell">{{ result.title }}</td>
+              <td>
+                <form action="{{ url_for('add_download') }}" method="post">
+                  <input type="hidden" name="media_key" value="{{ media_key }}">
+                  <input type="hidden" name="query" value="{{ query }}">
+                  <input type="hidden" name="indexer" value="{{ result.indexer }}">
+                  <input type="hidden" name="title" value="{{ result.title }}">
+                  <input type="hidden" name="size" value="{{ result.size }}">
+                  <input type="hidden" name="size_bytes" value="{{ result.size_bytes }}">
+                  <input type="hidden" name="seeders" value="{{ result.seeders }}">
+                  <input type="hidden" name="leechers" value="{{ result.leechers }}">
+                  <input type="hidden" name="categories" value="{{ ','.join(result.categories) }}">
+                  <input type="hidden" name="guid" value="{{ result.guid }}">
+                  <input type="hidden" name="link" value="{{ result.link }}">
+                  <button type="submit" data-busy-label="Adding...">Add</button>
+                </form>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="empty">Search results will appear here.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel pane transmission-pane">
+    <div class="panel-heading">
+      <h1>Downloads</h1>
+      <a class="pane-link" href="{{ config.transmission_web_url }}" target="_blank" rel="noreferrer">Open Transmission GUI</a>
+      <span class="muted" id="torrent-refresh-label">Refreshes every 5s</span>
+    </div>
+    <div class="table-wrap">
+      <table id="torrents-table" data-media-key="{{ media_key }}">
+        <thead>
+          <tr>
+            <th>State</th>
+            <th>Size</th>
+            <th>Progress</th>
+            <th>ETA</th>
+            <th>DL</th>
+            <th>Peers</th>
+            <th>Name</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for torrent in torrents %}
+            {% set view = torrent|torrent_view %}
+            <tr>
+              <td>{{ view.state }}</td>
+              <td>{{ view.size }}</td>
+              <td>{{ view.progress }}</td>
+              <td>{{ view.eta }}</td>
+              <td>{{ view.download_rate }}</td>
+              <td>{{ view.peers }}</td>
+              <td class="title-cell">{{ view.name }}</td>
+              <td class="actions">
+                <form action="{{ url_for('control_torrent', torrent_id=view.id, action='start' if view.paused else 'stop') }}" method="post" data-torrent-control>
+                  <input type="hidden" name="media_key" value="{{ media_key }}">
+                  <input type="hidden" name="query" value="{{ query }}">
+                  <button type="submit" data-busy-label="{{ 'Resuming...' if view.paused else 'Pausing...' }}">{{ "Resume" if view.paused else "Pause" }}</button>
+                </form>
+                {% if view.complete %}
+                  <a class="button secondary" href="{{ url_for('move_form', torrent_id=view.id, media_key=media_key) }}">Move</a>
+                {% endif %}
+                <form action="{{ url_for('control_torrent', torrent_id=view.id, action='remove_destroy') }}" method="post" data-confirm="Remove torrent and delete local data?" data-torrent-control>
+                  <input type="hidden" name="media_key" value="{{ media_key }}">
+                  <input type="hidden" name="query" value="{{ query }}">
+                  <button type="submit" class="danger" data-busy-label="Removing...">Remove</button>
+                </form>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="8" class="empty">No torrents reported by Transmission.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</section>
+{% endblock %}

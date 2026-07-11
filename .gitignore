@@ -13,3 +13,5 @@ jackett-config/*
 !jackett-config/.gitkeep
 curator/client.toml
 curator/server.toml
+curator/curator.toml
+curator-config/curator.toml

@@ -70,7 +70,7 @@ def load_api_key(config_dir: Path) -> str:
 
 def describe_torrent_status(torrent: dict) -> str:
     status = torrent.get("status")
-    if torrent.get("leftUntilDone") == 0 or torrent.get("percentDone") == 1:
+    if torrent_is_complete(torrent):
         return "complete"
     if status == 0:
         return "paused"
@@ -78,6 +78,14 @@ def describe_torrent_status(torrent: dict) -> str:
     if isinstance(percent_done, (int, float)):
         return format_percent_done(percent_done)
     return "active"
+
+
+def torrent_is_complete(torrent: dict) -> bool:
+    percent_done = torrent.get("percentDone")
+    if isinstance(percent_done, (int, float)):
+        return percent_done >= 1
+    total_size = torrent.get("totalSize")
+    return torrent.get("leftUntilDone") == 0 and isinstance(total_size, int) and total_size > 0
 
 
 def format_percent_done(value: float) -> str:

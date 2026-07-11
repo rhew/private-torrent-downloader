@@ -25,24 +25,27 @@ services:
       - 9117:9117
     restart: always
 
-  curator-server:
+  curator:
     build:
       context: .
       dockerfile: Dockerfile.curator
-    container_name: curator-server
+    container_name: curator
     environment:
-      - CURATOR_TOKEN=${CURATOR_TOKEN:-}
       - CURATOR_JACKETT_BASE_URL=http://jackett:9117
       - CURATOR_TRANSMISSION_JACKETT_BASE_URL=http://jackett:9117
       - CURATOR_TRANSMISSION_RPC_URL=http://gluetun:9091/transmission/rpc
+      - CURATOR_TRANSMISSION_WEB_URL=http://localhost:9091
       - CURATOR_JACKETT_CONFIG_DIR=/app/jackett-config/Jackett
       - CURATOR_DOWNLOADS_ROOT=/app/downloads
       - CURATOR_LIBRARY_ROOT=/app/library
+      - CURATOR_GLUETUN_STATE_PATH=/app/gluetun/vpngate-state.json
     volumes:
-      - ./curator/server.toml:/app/curator/server.toml:ro
+      - ./curator-config:/app/config:ro
       - ${JACKETT_CONFIG_DIR:-./jackett-config}:/app/jackett-config
       - ${DOWNLOADS_DIR:-./downloads}:/app/downloads
       - ${LIBRARY_DIR:-./library}:/app/library
+      - ./gluetun:/app/gluetun:ro
+    command: ["python", "-m", "curator.server", "--config", "/app/config/curator.toml", "--host", "0.0.0.0", "--port", "8787"]
     ports:
       - ${CURATOR_PORT:-8787}:8787
     depends_on:

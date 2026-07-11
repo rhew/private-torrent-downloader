@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Curator{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='curator.css') }}">
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="{{ url_for('index', media_key=media_key) }}">Curator</a>
+  </header>
+  <main class="page {{ page_class|default('') }}">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="{{ url_for('static', filename='curator.js') }}"></script>
+</body>
+</html>
