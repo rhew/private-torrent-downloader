@@ -34,7 +34,6 @@ services:
       - CURATOR_JACKETT_BASE_URL=http://jackett:9117
       - CURATOR_TRANSMISSION_JACKETT_BASE_URL=http://jackett:9117
       - CURATOR_TRANSMISSION_RPC_URL=http://gluetun:9091/transmission/rpc
-      - CURATOR_TRANSMISSION_WEB_URL=http://localhost:9091
       - CURATOR_JACKETT_CONFIG_DIR=/app/jackett-config/Jackett
       - CURATOR_DOWNLOADS_ROOT=/app/downloads
       - CURATOR_LIBRARY_ROOT=/app/library

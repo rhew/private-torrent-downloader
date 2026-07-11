@@ -12,6 +12,7 @@ import shutil
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
@@ -540,6 +541,7 @@ def base_context(service: CuratorService, media_key: str) -> dict[str, Any]:
         torrent_error = f"Transmission progress failed: {error}"
     return {
         "config": service.config,
+        "transmission_web_url": public_transmission_web_url(service.config.transmission_web_url),
         "media_key": media_key,
         "media": service.config.media_types[media_key],
         "media_types": service.config.media_types,
@@ -573,6 +575,17 @@ def dashboard_context(
         }
     )
     return context
+
+
+def public_transmission_web_url(configured_url: str) -> str:
+    parsed = urlsplit(configured_url)
+    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return configured_url
+    request_host = request.host.split(":", 1)[0]
+    netloc = request_host
+    if parsed.port:
+        netloc = f"{request_host}:{parsed.port}"
+    return urlunsplit((parsed.scheme or request.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def render_dashboard_with_optional_search(
