@@ -142,7 +142,7 @@ def search_type_for_categories(categories: tuple[str, ...]) -> str:
 
 
 def suggest_move_target(
-    media_key: str,
+    categories: tuple[str, ...],
     library_dir: Path,
     source_name: str,
     source_is_dir: bool,
@@ -155,14 +155,12 @@ def suggest_move_target(
     if not source_name:
         return fallback
 
-    normalized_media = media_key.lower()
-    is_movie_media = normalized_media in {"movies", "movie"} or normalized_media.startswith("movie")
-    is_show_media = normalized_media in {"shows", "show", "tv"} or normalized_media.startswith("show")
-    if not is_movie_media and not is_show_media:
+    naming_rule = move_naming_rule(categories)
+    if naming_rule is None:
         return MoveSuggestion(
             dest_dir=str(library_dir),
             filename=source_name,
-            message=f"Automatic naming: no supported rule for media type {media_key!r}. Using the current name.",
+            message="Automatic naming: no supported rule for this media category. Using the current name.",
         )
 
     try:
@@ -183,12 +181,44 @@ def suggest_move_target(
             message=f"Automatic naming failed: GuessIt could not parse this item ({error}).",
         )
 
-    if is_movie_media:
+    if naming_rule == "movie":
         return suggest_movie_target(library_dir, source_name, source_is_dir, info)
-    if is_show_media:
+    if naming_rule == "show":
         return suggest_episode_target(library_dir, source_name, source_is_dir, info)
 
     return fallback
+
+
+def infer_media_key(source_name: str, media_types: dict) -> str | None:
+    if not source_name:
+        return None
+
+    try:
+        from guessit import guessit
+    except ImportError:
+        return None
+
+    try:
+        info = dict(guessit(source_name))
+    except Exception:
+        return None
+
+    if not _looks_like_show(info):
+        return None
+
+    for media_key, media in media_types.items():
+        if move_naming_rule(media.categories) == "show":
+            return media_key
+    return None
+
+
+def move_naming_rule(categories: tuple[str, ...]) -> str | None:
+    search_type = search_type_for_categories(categories)
+    if search_type == "movie-search":
+        return "movie"
+    if search_type == "tv-search":
+        return "show"
+    return None
 
 
 def suggest_movie_target(
@@ -279,3 +309,12 @@ def clean_path_component(value: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*]+', " ", value)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     return cleaned
+
+
+def _looks_like_show(info: dict) -> bool:
+    if scalar_int(info.get("season")) is not None:
+        return True
+    episode = info.get("episode")
+    if isinstance(episode, (list, tuple)):
+        return any(scalar_int(item) is not None for item in episode)
+    return scalar_int(episode) is not None

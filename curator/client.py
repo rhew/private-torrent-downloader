@@ -14,6 +14,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 JACKETT_CONFIG_FILE = Path("ServerConfig.json")
@@ -444,7 +445,7 @@ def build_torrent_add_arguments(
     transmission_jackett_base_url: str,
     local_jackett_base_url: str,
     timeout: float,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     reference = download_reference_for_transmission(result, transmission_jackett_base_url)
     if reference.startswith("magnet:"):
         return {"filename": reference}
@@ -542,7 +543,7 @@ class TransmissionClient:
             headers["X-Transmission-Session-Id"] = self.session_id
         return headers
 
-    def add_torrent(self, arguments: dict[str, str]) -> dict:
+    def add_torrent(self, arguments: dict[str, Any]) -> dict:
         response = self.request("torrent-add", arguments)
         return response.get("torrent-added") or response.get("torrent-duplicate") or {}
 
@@ -565,6 +566,7 @@ class TransmissionClient:
                 "peersConnected",
                 "peersGettingFromUs",
                 "peersSendingToUs",
+                "labels",
             ],
         }).get("torrents", [])
 

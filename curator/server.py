@@ -33,6 +33,7 @@ from .client import (
 from .config import CuratorConfig, MediaTypeConfig, load_config
 from .core import (
     desired_indexers_by_media,
+    infer_media_key,
     indexer_reconciliation_failure_count,
     indexer_reconciliation_report,
     suggest_move_target,
@@ -49,6 +50,8 @@ TORRENT_STATUS = {
     5: "seed wait",
     6: "seeding",
 }
+
+CURATOR_MEDIA_LABEL_PREFIX = "curator:"
 
 
 @dataclass
@@ -195,13 +198,14 @@ class CuratorService:
         )
         return results, config_errors | errors
 
-    def add_download(self, result: SearchResult) -> dict[str, Any]:
+    def add_download(self, result: SearchResult, media_key: str) -> dict[str, Any]:
         arguments = build_torrent_add_arguments(
             result,
             self.config.transmission_jackett_base_url,
             self.config.jackett_base_url,
             self.config.timeout,
         )
+        arguments["labels"] = [f"{CURATOR_MEDIA_LABEL_PREFIX}{media_key}"]
         return TransmissionClient(self.config.transmission_rpc_url).add_torrent(arguments)
 
     def torrents(self) -> list[dict]:
@@ -226,7 +230,7 @@ class CuratorService:
 
     def move_suggestion(self, media: MediaTypeConfig, torrent: dict) -> dict[str, Any]:
         suggestion = suggest_move_target(
-            media_key=media.key,
+            categories=media.categories,
             library_dir=self.local_dest_path(str(media.library_dir)),
             source_name=torrent.get("name") or "",
             source_is_dir=self.torrent_source_is_dir(torrent),
@@ -392,7 +396,7 @@ def create_app(config: CuratorConfig) -> Flask:
         query = str(request.form.get("query") or "").strip()
         result = search_result_from_form(request.form)
         try:
-            torrent = service.add_download(result)
+            torrent = service.add_download(result, media_key)
         except Exception as error:
             return render_dashboard_with_optional_search(
                 service,
@@ -449,6 +453,7 @@ def create_app(config: CuratorConfig) -> Flask:
         try:
             torrent = service.torrent(torrent_id)
             ensure_complete(torrent)
+            media_key = move_media_key(service.config, torrent, media_key)
             suggestion = service.move_suggestion(service.config.media_types[media_key], torrent)
             dest_exists = service.local_dest_path(suggestion["dest_dir"]).exists()
         except Exception as error:
@@ -473,6 +478,7 @@ def create_app(config: CuratorConfig) -> Flask:
         try:
             torrent = service.torrent(torrent_id)
             ensure_complete(torrent)
+            media_key = move_media_key(service.config, torrent, media_key)
             if not dest_dir or not filename:
                 raise ValueError("destination directory and filename are required")
             dest_exists = service.local_dest_path(dest_dir).exists()
@@ -678,6 +684,20 @@ def selected_media_key(config: CuratorConfig, value: str | None) -> str:
     if value in config.media_types:
         return str(value)
     return config.default_media_type
+
+
+def move_media_key(config: CuratorConfig, torrent: dict, fallback_key: str) -> str:
+    for label in torrent.get("labels") or ():
+        if not isinstance(label, str) or not label.startswith(CURATOR_MEDIA_LABEL_PREFIX):
+            continue
+        media_key = label.removeprefix(CURATOR_MEDIA_LABEL_PREFIX)
+        if media_key in config.media_types:
+            return media_key
+
+    inferred_key = infer_media_key(str(torrent.get("name") or ""), config.media_types)
+    if inferred_key is not None:
+        return inferred_key
+    return fallback_key
 
 
 def ensure_complete(torrent: dict) -> None:
