@@ -3,6 +3,7 @@
 downloads/
 library/
 media/
+transmission-config/
 vpngate.ovpn
 gluetun/vpngate.ovpn
 gluetun/vpngate-state.json

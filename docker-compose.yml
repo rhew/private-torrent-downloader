@@ -8,6 +8,7 @@ services:
       - PGID=${APP_GID:-1000}
       - TZ=${TZ:-America/New_York}
     volumes:
+      - ${TRANSMISSION_CONFIG_DIR:-./transmission-config}:/config
       - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env}/downloads:/downloads
     network_mode: "service:gluetun"
     restart: always
