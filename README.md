@@ -50,7 +50,7 @@ TRANSMISSION_CONFIG_DIR=./transmission-config
 JACKETT_CONFIG_DIR=./jackett-config
 ```
 
-`MEDIA_ROOT` must be the common host parent of directories named `downloads` and `library`. For an existing layout such as `/srv/media/downloads` and `/srv/media/library`, set `MEDIA_ROOT=/srv/media`; no media migration is required.
+`MEDIA_ROOT` must be the common host parent of directories named `downloads` and `library`.
 
 `APP_UID` and `APP_GID` are passed to LinuxServer containers as `PUID` and `PGID`. Set these when needed:
 
@@ -72,27 +72,9 @@ mkdir -p media/downloads media/library transmission-config data/jellyfin/config 
 
 The directories mounted into containers must be writable by `APP_UID:APP_GID`. This matters for `media/downloads/`, `media/library/`, `transmission-config/`, `jackett-config/`, and `data/jellyfin/`.
 
-For an existing deployment that used `DOWNLOADS_DIR` and `LIBRARY_DIR`, replace both variables with their common parent as `MEDIA_ROOT`. Recreate only Curator first, after any active move finishes:
-
-```bash
-docker compose up -d curator
-```
-
 Transmission continues to see downloads at `/downloads`, and Jellyfin continues to see the library at `/media`.
 
-#### Preserve an existing Transmission configuration
-
-New deployments can start with an empty `TRANSMISSION_CONFIG_DIR`; Transmission initializes it automatically. Before recreating an existing Transmission container for the first time with this mount, copy its current settings, torrent metadata, and resume state to the host:
-
-```bash
-mkdir -p transmission-config
-docker compose stop curator transmission
-docker cp transmission:/config/. ./transmission-config/
-test -s transmission-config/settings.json
-docker compose up -d transmission curator
-```
-
-Do not run the final `docker compose up` if the `test` command fails. If `TRANSMISSION_CONFIG_DIR` is not `./transmission-config`, use its exact host path in the `mkdir`, `docker cp`, and `test` commands. Ensure the copied directory is writable by `APP_UID:APP_GID`.
+`TRANSMISSION_CONFIG_DIR` persists Transmission settings, torrent metadata, and resume state across container recreation.
 
 ### Configure Curator
 
