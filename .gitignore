@@ -2,6 +2,7 @@
 .env
 downloads/
 library/
+media/
 vpngate.ovpn
 gluetun/vpngate.ovpn
 gluetun/vpngate-state.json

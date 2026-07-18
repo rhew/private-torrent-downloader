@@ -8,20 +8,17 @@ Three pieces:
 
 ## Media File Layout
 
-By default the compose file mounts repo-local `downloads/` and `library/` directories. Override them with `DOWNLOADS_DIR` and `LIBRARY_DIR` in `.env` when the storage lives elsewhere.
+The Compose deployment requires one `MEDIA_ROOT` containing both `downloads/` and `library/`. Curator mounts this root once so archives use an atomic filesystem rename and never fall back to copying media.
 
 ```text
-downloads/        # transmission stages
-  incomplete/
-  complete/
+media/
+  downloads/      # transmission stages
+    incomplete/
+    complete/
+  library/        # Jellyfin serves
     books/
     isos/
     etc...
-
-library/          # Jellyfin serves
-  books/
-  isos/
-  etc...
 ```
 
 ## Networking Design
@@ -48,10 +45,11 @@ Set at least:
 ```dotenv
 APP_UID=1000
 APP_GID=1000
-DOWNLOADS_DIR=./downloads
-LIBRARY_DIR=./library
+MEDIA_ROOT=./media
 JACKETT_CONFIG_DIR=./jackett-config
 ```
+
+`MEDIA_ROOT` must be the common host parent of directories named `downloads` and `library`. For an existing layout such as `/srv/media/downloads` and `/srv/media/library`, set `MEDIA_ROOT=/srv/media`; no media migration is required.
 
 `APP_UID` and `APP_GID` are passed to LinuxServer containers as `PUID` and `PGID`. Set these when needed:
 
@@ -68,10 +66,18 @@ RENDER_GID=992
 ### Make the local data directories, or update `.env` to point to existing storage.
 
 ```
-mkdir -p downloads library data/jellyfin/config data/jellyfin/cache gluetun curator-config
+mkdir -p media/downloads media/library data/jellyfin/config data/jellyfin/cache gluetun curator-config
 ```
 
-The directories mounted into containers must be writable by `APP_UID:APP_GID`. This matters for `downloads/`, `library/`, `jackett-config/`, and `data/jellyfin/`.
+The directories mounted into containers must be writable by `APP_UID:APP_GID`. This matters for `media/downloads/`, `media/library/`, `jackett-config/`, and `data/jellyfin/`.
+
+For an existing deployment that used `DOWNLOADS_DIR` and `LIBRARY_DIR`, replace both variables with their common parent as `MEDIA_ROOT`. Recreate only Curator first, after any active move finishes:
+
+```bash
+docker compose up -d curator
+```
+
+Transmission continues to see downloads at `/downloads`, and Jellyfin continues to see the library at `/media`.
 
 ### Configure Curator
 

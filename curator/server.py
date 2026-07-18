@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from datetime import timezone
+import errno
 import hashlib
 import json
 import logging
@@ -317,7 +318,15 @@ class CuratorService:
         if dest_local.exists():
             raise FileExistsError(f"destination already exists: {dest_local}")
 
-        shutil.move(str(source_local), str(dest_local))
+        try:
+            os.rename(source_local, dest_local)
+        except OSError as error:
+            if error.errno == errno.EXDEV:
+                raise RuntimeError(
+                    "move refused: downloads and library must be on the same Curator mount"
+                ) from error
+            detail = error.strerror or str(error)
+            raise RuntimeError(f"move failed from {source_local} to {dest_local}: {detail}") from error
         TransmissionClient(self.config.transmission_rpc_url).remove_torrents(
             [torrent.get("id")],
             delete_local_data=False,
