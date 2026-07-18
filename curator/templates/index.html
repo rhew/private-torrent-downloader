@@ -19,9 +19,25 @@
   </form>
 </section>
 
-<div class="visible-status">
-  {{ status or indexer_summary.message }}
-</div>
+<section class="activity-panel" id="activity-panel" aria-live="polite">
+  <div class="activity-heading">
+    <strong>Activity</strong>
+    {% set running_count = activities|selectattr("status", "equalto", "running")|list|length %}
+    <span class="activity-summary" id="activity-summary">
+      {{ running_count ~ " running" if running_count else "Recent" }}
+    </span>
+  </div>
+  <ul class="activity-list" id="activity-list">
+    {% for activity in activities %}
+      <li class="activity-item {{ activity.status }}">
+        <span class="activity-marker" aria-hidden="true"></span>
+        <span>{{ activity.error or activity.message or activity.label }}</span>
+      </li>
+    {% else %}
+      <li class="activity-empty">No recent activity.</li>
+    {% endfor %}
+  </ul>
+</section>
 
 <details class="status-drop">
   <summary>
@@ -29,15 +45,6 @@
     <span class="summary-hint">open for services, storage, and config</span>
   </summary>
   <div class="status-content">
-    {% if error %}
-      <div class="notice error">{{ error }}</div>
-    {% endif %}
-    {% if torrent_error %}
-      <div class="notice error">{{ torrent_error }}</div>
-    {% endif %}
-    {% if job_id %}
-      <div class="notice" id="job-status" data-job-id="{{ job_id }}">Move is running...</div>
-    {% endif %}
     <section class="system-section">
       <h2>Filesystem</h2>
       <div class="overview-grid">
@@ -94,16 +101,6 @@
       </dl>
     </section>
 
-    {% if errors %}
-      <section class="notice warning">
-        <strong>Search issues</strong>
-        <ul>
-          {% for indexer, message in errors.items() %}
-            <li>{{ indexer|display_name }}: {{ message }}</li>
-          {% endfor %}
-        </ul>
-      </section>
-    {% endif %}
   </div>
 </details>
 

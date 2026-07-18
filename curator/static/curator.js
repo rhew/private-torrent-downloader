@@ -95,12 +95,16 @@ function bindTorrentControlForms() {
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Torrent update failed.");
-        setStatusMessage(data.status || "Torrent updated.");
         await refreshTorrents();
+        await refreshActivity();
       } catch (error) {
-        setStatusMessage(error.message);
-        resetBusyButton(button);
+        try {
+          await refreshActivity();
+        } catch {
+          prependLocalActivity(error.message, "failed");
+        }
       } finally {
+        resetBusyButton(button);
         document.body.dataset.formBusy = "false";
       }
     });
@@ -120,11 +124,6 @@ function resetBusyButton(button) {
   button.textContent = button.dataset.originalLabel || button.textContent;
   button.classList.remove("is-busy");
   button.disabled = false;
-}
-
-function setStatusMessage(message) {
-  const status = document.querySelector(".visible-status");
-  if (status) status.textContent = message;
 }
 
 function renderTorrentRows(torrents, mediaKey) {
@@ -195,24 +194,55 @@ function pollTorrents() {
   }, 5000);
 }
 
-function pollJob() {
-  const status = document.querySelector("#job-status[data-job-id]");
-  if (!status) return;
-  const jobId = status.dataset.jobId;
-  const timer = window.setInterval(async () => {
-    const response = await fetch(`/api/jobs/${jobId}`, {headers: {"Accept": "application/json"}});
-    const data = await response.json();
-    if (!response.ok) {
-      status.textContent = data.error || "Move status unavailable.";
-      status.classList.add("error");
-      window.clearInterval(timer);
-      return;
-    }
-    status.textContent = data.error || data.message || data.status;
-    status.classList.toggle("success", data.status === "complete");
-    status.classList.toggle("error", data.status === "failed");
-    if (data.status !== "running") {
-      window.clearInterval(timer);
+function renderActivities(activities) {
+  const list = document.querySelector("#activity-list");
+  const summary = document.querySelector("#activity-summary");
+  if (!list || !summary) return;
+  const running = activities.filter((activity) => activity.status === "running").length;
+  summary.textContent = running ? `${running} running` : "Recent";
+  if (!activities.length) {
+    list.innerHTML = '<li class="activity-empty">No recent activity.</li>';
+    return;
+  }
+  list.innerHTML = activities.map((activity) => {
+    const status = new Set(["running", "complete", "warning", "failed"]).has(activity.status)
+      ? activity.status
+      : "complete";
+    const message = activity.error || activity.message || activity.label || "Activity updated.";
+    return `<li class="activity-item ${status}">
+      <span class="activity-marker" aria-hidden="true"></span>
+      <span>${escapeHtml(message)}</span>
+    </li>`;
+  }).join("");
+}
+
+async function refreshActivity() {
+  if (!document.querySelector("#activity-panel")) return;
+  const response = await fetch("/api/activity", {headers: {"Accept": "application/json"}});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Activity status unavailable.");
+  renderActivities(data.activities || []);
+}
+
+function prependLocalActivity(message, status) {
+  const list = document.querySelector("#activity-list");
+  const summary = document.querySelector("#activity-summary");
+  if (!list || !summary) return;
+  list.querySelector(".activity-empty")?.remove();
+  list.insertAdjacentHTML("afterbegin", `<li class="activity-item ${status}">
+    <span class="activity-marker" aria-hidden="true"></span>
+    <span>${escapeHtml(message)}</span>
+  </li>`);
+  summary.textContent = "Recent";
+}
+
+function pollActivity() {
+  if (!document.querySelector("#activity-panel")) return;
+  window.setInterval(async () => {
+    try {
+      await refreshActivity();
+    } catch (error) {
+      // Keep the last useful activity state when polling is temporarily unavailable.
     }
   }, 1500);
 }
@@ -231,5 +261,5 @@ document.addEventListener("DOMContentLoaded", () => {
   bindBusyForms();
   bindTorrentControlForms();
   pollTorrents();
-  pollJob();
+  pollActivity();
 });

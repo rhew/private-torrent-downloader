@@ -6,6 +6,7 @@ from datetime import datetime
 from datetime import timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -52,6 +53,8 @@ TORRENT_STATUS = {
 }
 
 CURATOR_MEDIA_LABEL_PREFIX = "curator:"
+ACTIVITY_LIMIT = 20
+LOGGER = logging.getLogger("curator")
 
 
 @dataclass
@@ -61,7 +64,8 @@ class BackgroundJob:
     status: str = "running"
     message: str = ""
     error: str = ""
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class JobStore:
@@ -73,9 +77,31 @@ class JobStore:
         job_id = uuid4().hex
         with self.lock:
             self.jobs[job_id] = BackgroundJob(id=job_id, label=label, message=f"{label} started.")
+            self._prune_locked()
+        LOGGER.info("%s started", label)
         thread = threading.Thread(target=self._run, args=(job_id, target, args), daemon=True)
         thread.start()
         return job_id
+
+    def record(self, message: str, status: str = "complete") -> str:
+        activity_id = uuid4().hex
+        activity = BackgroundJob(
+            id=activity_id,
+            label=message,
+            status=status,
+            message=message,
+            error=message if status == "failed" else "",
+        )
+        with self.lock:
+            self.jobs[activity_id] = activity
+            self._prune_locked()
+        log = LOGGER.error
+        if status == "warning":
+            log = LOGGER.warning
+        elif status != "failed":
+            log = LOGGER.info
+        log("%s", message)
+        return activity_id
 
     def _run(self, job_id: str, target, args) -> None:
         try:
@@ -84,17 +110,43 @@ class JobStore:
             with self.lock:
                 job = self.jobs[job_id]
                 job.status = "failed"
-                job.error = str(error)
+                job.error = f"{job.label} failed: {error}"
                 job.message = f"{job.label} failed."
+                job.updated_at = datetime.now(timezone.utc)
+                self._prune_locked()
+            LOGGER.error("%s", job.error)
             return
         with self.lock:
             job = self.jobs[job_id]
             job.status = "complete"
             job.message = str(message)
+            job.updated_at = datetime.now(timezone.utc)
+            self._prune_locked()
+        LOGGER.info("%s", job.message)
 
-    def get(self, job_id: str) -> BackgroundJob | None:
+    def recent(self, limit: int = 6) -> list[BackgroundJob]:
         with self.lock:
-            return self.jobs.get(job_id)
+            running = sorted(
+                (job for job in self.jobs.values() if job.status == "running"),
+                key=lambda job: job.created_at,
+                reverse=True,
+            )
+            completed = sorted(
+                (job for job in self.jobs.values() if job.status != "running"),
+                key=lambda job: job.updated_at,
+                reverse=True,
+            )
+            return running + completed[:max(0, limit - len(running))]
+
+    def _prune_locked(self) -> None:
+        if len(self.jobs) <= ACTIVITY_LIMIT:
+            return
+        completed = sorted(
+            (job for job in self.jobs.values() if job.status != "running"),
+            key=lambda job: job.updated_at,
+        )
+        while len(self.jobs) > ACTIVITY_LIMIT and completed:
+            del self.jobs[completed.pop(0).id]
 
 
 class CuratorService:
@@ -336,13 +388,10 @@ def create_app(config: CuratorConfig) -> Flask:
             "index.html",
             **dashboard_context(
                 service,
+                jobs,
                 selected_media_key(service.config, request.args.get("media_key")),
                 query=request.args.get("query", ""),
                 results=[],
-                errors={},
-                status=request.args.get("status", ""),
-                error=request.args.get("error", ""),
-                job_id=request.args.get("job", ""),
             ),
         )
 
@@ -351,42 +400,37 @@ def create_app(config: CuratorConfig) -> Flask:
         media_key = selected_media_key(service.config, request.form.get("media_key"))
         query = str(request.form.get("query") or "").strip()
         if not query:
+            jobs.record("Search failed: enter a search term.", status="failed")
             return render_template(
                 "index.html",
                 **dashboard_context(
                     service,
+                    jobs,
                     media_key,
                     query="",
                     results=[],
-                    errors={},
-                    status="",
-                    error="Enter a search term.",
-                    job_id="",
                 ),
             )
         try:
             results, errors = service.search(service.config.media_types[media_key], query)
-            status = f"Search complete: {len(results)} result(s)."
+            message = f"Search for {query!r} found {len(results)} result(s)."
             if errors:
-                status = f"Search complete: {len(results)} result(s), {len(errors)} indexer issue(s)."
+                details = "; ".join(f"{display_name(indexer)}: {detail}" for indexer, detail in errors.items())
+                message = f"Search for {query!r} found {len(results)} result(s). Indexer issues: {details}"
         except Exception as error:
             results = []
             errors = {}
-            status = ""
-            error_message = f"Search failed: {error}"
+            jobs.record(f"Search for {query!r} failed: {error}", status="failed")
         else:
-            error_message = ""
+            jobs.record(message, status="warning" if errors else "complete")
         return render_template(
             "index.html",
             **dashboard_context(
                 service,
+                jobs,
                 media_key,
                 query=query,
                 results=results,
-                errors=errors,
-                status=status,
-                error=error_message,
-                job_id="",
             ),
         )
 
@@ -398,20 +442,20 @@ def create_app(config: CuratorConfig) -> Flask:
         try:
             torrent = service.add_download(result, media_key)
         except Exception as error:
+            jobs.record(f"Add {result.title} failed: {error}", status="failed")
             return render_dashboard_with_optional_search(
                 service,
+                jobs,
                 media_key,
                 query,
-                status="",
-                error=f"Transmission add failed: {error}",
             )
         name = torrent.get("name") or result.title
+        jobs.record(f"Added to Transmission: {name}")
         return render_dashboard_with_optional_search(
             service,
+            jobs,
             media_key,
             query,
-            status=f"Added to Transmission: {name}",
-            error="",
         )
 
     @app.post("/torrents/<int:torrent_id>/<action>")
@@ -419,32 +463,35 @@ def create_app(config: CuratorConfig) -> Flask:
         media_key = selected_media_key(service.config, request.form.get("media_key"))
         query = str(request.form.get("query") or "").strip()
         wants_json = "application/json" in request.headers.get("Accept", "")
+        torrent_name = f"torrent {torrent_id}"
         try:
+            torrent_name = service.torrent(torrent_id).get("name") or torrent_name
             service.control_torrent(action, torrent_id)
         except Exception as error:
+            message = f"Update {torrent_name} failed: {error}"
+            jobs.record(message, status="failed")
             if wants_json:
-                return jsonify({"error": f"Transmission control failed: {error}"}), 500
+                return jsonify({"error": message}), 500
             return render_dashboard_with_optional_search(
                 service,
+                jobs,
                 media_key,
                 query,
-                status="",
-                error=f"Transmission control failed: {error}",
             )
         messages = {
-            "start": "Torrent resumed.",
-            "stop": "Torrent paused.",
-            "remove_destroy": "Torrent removed and local data deleted.",
+            "start": f"Resumed {torrent_name}.",
+            "stop": f"Paused {torrent_name}.",
+            "remove_destroy": f"Removed {torrent_name} and deleted its local data.",
         }
-        message = messages.get(action, "Torrent updated.")
+        message = messages.get(action, f"Updated {torrent_name}.")
+        jobs.record(message)
         if wants_json:
             return jsonify({"status": message})
         return render_dashboard_with_optional_search(
             service,
+            jobs,
             media_key,
             query,
-            status=message,
-            error="",
         )
 
     @app.get("/torrents/<int:torrent_id>/move")
@@ -457,7 +504,8 @@ def create_app(config: CuratorConfig) -> Flask:
             suggestion = service.move_suggestion(service.config.media_types[media_key], torrent)
             dest_exists = service.local_dest_path(suggestion["dest_dir"]).exists()
         except Exception as error:
-            return redirect(url_for("index", media_key=media_key, error=f"Move setup failed: {error}"))
+            jobs.record(f"Move setup failed: {error}", status="failed")
+            return redirect(url_for("index", media_key=media_key))
         return render_template(
             "move.html",
             config=service.config,
@@ -495,9 +543,10 @@ def create_app(config: CuratorConfig) -> Flask:
                     error="Check create directory to archive to this destination.",
                 )
         except Exception as error:
-            return redirect(url_for("index", media_key=media_key, error=f"Move setup failed: {error}"))
+            jobs.record(f"Move setup failed: {error}", status="failed")
+            return redirect(url_for("index", media_key=media_key))
 
-        job_id = jobs.start(
+        jobs.start(
             f"Move {torrent.get('name') or torrent_id}",
             service.move_completed_torrent,
             torrent,
@@ -505,7 +554,7 @@ def create_app(config: CuratorConfig) -> Flask:
             filename,
             create_dir,
         )
-        return redirect(url_for("index", media_key=media_key, job=job_id, status="Move started."))
+        return redirect(url_for("index", media_key=media_key))
 
     @app.get("/config")
     def config_page():
@@ -526,16 +575,18 @@ def create_app(config: CuratorConfig) -> Flask:
             return jsonify({"error": str(error)}), 500
         return jsonify({"torrents": [torrent_view(torrent) for torrent in torrents]})
 
-    @app.get("/api/jobs/<job_id>")
-    def api_job(job_id: str):
-        job = jobs.get(job_id)
-        if job is None:
-            return jsonify({"error": "job not found"}), 404
-        payload = asdict(job)
-        payload["created_at"] = job.created_at.isoformat()
-        return jsonify(payload)
+    @app.get("/api/activity")
+    def api_activity():
+        return jsonify({"activities": [activity_payload(job) for job in jobs.recent()]})
 
     return app
+
+
+def activity_payload(job: BackgroundJob) -> dict[str, Any]:
+    payload = asdict(job)
+    payload["created_at"] = job.created_at.isoformat()
+    payload["updated_at"] = job.updated_at.isoformat()
+    return payload
 
 
 def base_context(service: CuratorService, media_key: str) -> dict[str, Any]:
@@ -559,24 +610,18 @@ def base_context(service: CuratorService, media_key: str) -> dict[str, Any]:
 
 def dashboard_context(
     service: CuratorService,
+    jobs: JobStore,
     media_key: str,
     query: str,
     results: list[SearchResult],
-    errors: dict[str, str],
-    status: str,
-    error: str,
-    job_id: str,
 ) -> dict[str, Any]:
     context = base_context(service, media_key)
     context.update(
         {
             "query": query,
             "results": results,
-            "errors": errors,
             "overview": system_overview(service, context["torrents"], context["torrent_error"]),
-            "status": status,
-            "error": error,
-            "job_id": job_id,
+            "activities": jobs.recent(),
             "page_class": "dashboard-page",
         }
     )
@@ -596,29 +641,24 @@ def public_transmission_web_url(configured_url: str) -> str:
 
 def render_dashboard_with_optional_search(
     service: CuratorService,
+    jobs: JobStore,
     media_key: str,
     query: str,
-    status: str,
-    error: str,
 ):
     results: list[SearchResult] = []
-    errors: dict[str, str] = {}
     if query:
         try:
-            results, errors = service.search(service.config.media_types[media_key], query)
+            results, _ = service.search(service.config.media_types[media_key], query)
         except Exception as search_error:
-            error = f"{error} Search refresh failed: {search_error}".strip()
+            jobs.record(f"Search refresh for {query!r} failed: {search_error}", status="failed")
     return render_template(
         "index.html",
         **dashboard_context(
             service,
+            jobs,
             media_key,
             query=query,
             results=results,
-            errors=errors,
-            status=status,
-            error=error,
-            job_id="",
         ),
     )
 
@@ -634,10 +674,10 @@ def run_startup_indexer_check(service: CuratorService) -> None:
         try:
             service.reconcile_indexers()
             if attempt:
-                print("Curator indexer check succeeded after retry.", flush=True)
+                LOGGER.info("Indexer check succeeded after retry")
             return
         except Exception as error:
-            print(f"Curator indexer check failed: {error}", flush=True)
+            LOGGER.error("Indexer check failed: %s", error)
             if attempt == len(delays):
                 return
             time.sleep(delays[attempt])
@@ -660,17 +700,17 @@ def watch_config_file(service: CuratorService, interval: int = 10) -> None:
             next_config = load_config(config_path)
         except Exception as error:
             service.indexer_error = f"Config reload failed: {error}"
-            print(f"Curator config reload failed: {error}", flush=True)
+            LOGGER.error("Config reload failed: %s", error)
             continue
         current_digest = next_digest
         service.config = next_config
         service.api_key = None
         service.jackett_indexers = {}
-        print(f"Curator config reloaded from {config_path}", flush=True)
+        LOGGER.info("Config reloaded from %s", config_path)
         try:
             service.reconcile_indexers()
         except Exception as error:
-            print(f"Curator indexer check failed after config reload: {error}", flush=True)
+            LOGGER.error("Indexer check failed after config reload: %s", error)
 
 
 def file_digest(path: Path) -> str:
@@ -875,8 +915,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
     app = create_app(load_config(args.config))
-    print(f"Curator web listening on http://{args.host}:{args.port}")
+    LOGGER.info("Web listening on http://%s:%s", args.host, args.port)
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 

@@ -164,13 +164,89 @@ button.is-busy {
   border-left-color: var(--danger);
 }
 
-.visible-status {
-  padding: 10px 12px;
+.activity-panel {
+  min-height: 46px;
   border: 1px solid var(--line);
-  border-left: 5px solid var(--accent);
   border-radius: 8px;
   background: var(--panel);
+  overflow: hidden;
+}
+
+.activity-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.activity-summary {
+  color: var(--muted);
+  font-size: 12px;
   font-weight: 700;
+}
+
+.activity-list {
+  max-height: 132px;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.activity-item {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.activity-item:last-child {
+  border-bottom: 0;
+}
+
+.activity-marker {
+  width: 9px;
+  height: 9px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.activity-item.running .activity-marker {
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  background: transparent;
+  animation: activity-spin 0.8s linear infinite;
+}
+
+.activity-item.warning .activity-marker {
+  background: var(--warning);
+}
+
+.activity-item.failed .activity-marker {
+  background: var(--danger);
+}
+
+.activity-empty {
+  padding: 8px 12px;
+  color: var(--muted);
+}
+
+@keyframes activity-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-item.running .activity-marker {
+    animation: none;
+  }
 }
 
 .dashboard-grid {

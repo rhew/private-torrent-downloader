@@ -27,7 +27,7 @@
       </label>
     {% endif %}
     <div class="button-row">
-      <button type="submit">Start move</button>
+      <button type="submit" data-busy-label="Starting...">Start move</button>
       <a class="button secondary" href="{{ url_for('index', media_key=media_key) }}">Cancel</a>
     </div>
   </form>
