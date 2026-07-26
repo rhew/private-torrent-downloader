@@ -90,5 +90,6 @@ services:
       - ./data/jellyfin/config:/config
       - ./data/jellyfin/cache:/cache
       - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env}/library:/media
-      - /dev/dri:/dev/dri
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
     restart: always
