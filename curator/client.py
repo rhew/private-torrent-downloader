@@ -60,13 +60,30 @@ class JackettIndexer:
     categories: tuple[str, ...]
 
 
-def load_api_key(config_dir: Path) -> str:
+def load_server_config(config_dir: Path) -> dict[str, Any]:
     jackett_config_file = config_dir / JACKETT_CONFIG_FILE
     data = json.loads(jackett_config_file.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{jackett_config_file} must contain a JSON object")
+    return data
+
+
+def load_api_key(config_dir: Path) -> str:
+    jackett_config_file = config_dir / JACKETT_CONFIG_FILE
+    data = load_server_config(config_dir)
     api_key = data.get("APIKey")
     if not api_key:
         raise KeyError(f"APIKey not found in {jackett_config_file}")
     return api_key
+
+
+def load_flaresolverr_url(config_dir: Path) -> str:
+    jackett_config_file = config_dir / JACKETT_CONFIG_FILE
+    data = load_server_config(config_dir)
+    url = data.get("FlareSolverrUrl")
+    if not url:
+        raise KeyError(f"FlareSolverrUrl not found in {jackett_config_file}")
+    return str(url)
 
 
 def describe_torrent_status(torrent: dict) -> str:
@@ -430,13 +447,32 @@ def parse_int(value) -> int:
         return 0
 
 
-def download_reference_for_transmission(result: SearchResult, jackett_base_url: str) -> str:
+def replace_api_key(url: str, api_key: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(name.lower() == "apikey" for name, _ in query):
+        return url
+    updated_query = [
+        (name, api_key if name.lower() == "apikey" else value)
+        for name, value in query
+    ]
+    return urllib.parse.urlunsplit(
+        parsed._replace(query=urllib.parse.urlencode(updated_query))
+    )
+
+
+def download_reference_for_transmission(
+    result: SearchResult,
+    jackett_base_url: str,
+    api_key: str,
+) -> str:
     if result.link.startswith("magnet:"):
         return result.link
     if result.guid.startswith("magnet:"):
         return result.guid
     if result.link:
-        return rewrite_url_base(result.link, jackett_base_url)
+        reference = rewrite_url_base(result.link, jackett_base_url)
+        return replace_api_key(reference, api_key)
     return result.guid
 
 
@@ -444,13 +480,22 @@ def build_torrent_add_arguments(
     result: SearchResult,
     transmission_jackett_base_url: str,
     local_jackett_base_url: str,
+    api_key: str,
     timeout: float,
 ) -> dict[str, Any]:
-    reference = download_reference_for_transmission(result, transmission_jackett_base_url)
+    reference = download_reference_for_transmission(
+        result,
+        transmission_jackett_base_url,
+        api_key,
+    )
     if reference.startswith("magnet:"):
         return {"filename": reference}
 
-    local_reference = download_reference_for_transmission(result, local_jackett_base_url)
+    local_reference = download_reference_for_transmission(
+        result,
+        local_jackett_base_url,
+        api_key,
+    )
     redirect_target = get_redirect_location(local_reference, timeout)
     if redirect_target and redirect_target.startswith("magnet:"):
         return {"filename": redirect_target}

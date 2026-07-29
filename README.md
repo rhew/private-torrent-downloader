@@ -3,7 +3,7 @@
 Three pieces:
 
 1. A script to select a VPN from VPN Gate
-2. A Compose file to create the VPN with GlueTun, run Transmission, run Jackett, and run Jellyfin.
+2. A Compose file to create the VPN with GlueTun and run Transmission, Jackett, FlareSolverr, and Jellyfin.
 3. A `curator` web app. Curator owns Jackett, Transmission, and filesystem operations from one server-side UI.
 
 ## Media File Layout
@@ -27,7 +27,11 @@ media/
 - Transmission shares Gluetun's network namespace.
 - Transmission ports are published on the Gluetun service, not the Transmission service.
 - Gluetun's firewall is the fail-closed boundary.
-- Jackett and Curator stay on the normal Docker network unless there is a clear reason to proxy them.
+- Jackett, FlareSolverr, and Curator stay on the normal Docker network unless there is a clear reason to proxy them.
+- FlareSolverr is available only to other services on that network at `http://flaresolverr:8191`; its API is not published on the host.
+- Jackett's server configuration is stateless: its Compose startup command replaces `ServerConfig.json` with the inline FlareSolverr configuration before Jackett starts.
+- Curator reads Jackett's API key from the generated server configuration.
+- Curator checks FlareSolverr's readiness endpoint and shows its version in the dashboard Services section.
 - Curator imports completed downloads from `downloads/` and writes managed media to `library/`.
 - Jellyfin uses host networking for simpler discovery and serves the mounted `library/` tree.
 - Expose admin UIs only where you intend to manage them.
@@ -84,7 +88,7 @@ Start from the example config on the machine where Docker runs:
 cp curator-config/curator.example.toml curator-config/curator.toml
 ```
 
-Set the paths and service URLs for the host or container where Curator runs. `network.timeout` controls how long Curator waits for Jackett and Transmission calls.
+Set the paths and service URLs for the host or container where Curator runs. `network.timeout` controls how long Curator waits for Jackett and Transmission calls. Keep it above Jackett's 55-second FlareSolverr timeout; the default is 70 seconds.
 
 When running with Docker Compose, `curator-config/` is mounted as a read-only config directory and Curator reads `/app/config/curator.toml`. This lets Curator notice editors that save `curator.toml` by atomically replacing the file without exposing the application source tree as config.
 
@@ -122,13 +126,17 @@ python3 vpngate.py
 
 This writes `gluetun/vpngate.ovpn` and `gluetun/vpngate-state.json`.
 
-### Start Transmission, GlueTun, Jackett, Curator, and Jellyfin.
+### Start Transmission, GlueTun, Jackett, FlareSolverr, Curator, and Jellyfin.
 
 ```bash
 docker compose up -d
 ```
 
 Open Curator at `http://localhost:8787`, or replace `localhost` with the Docker host name when accessing it remotely.
+
+On every container start, Compose overwrites Jackett's persisted `ServerConfig.json` with the inline FlareSolverr URL and default 55-second timeout. Jackett then generates a new API key and instance ID. Curator reads the API key before each Jackett operation.
+
+This makes Jackett's server settings disposable: an admin password and changes made in Jackett's server-settings UI do not survive a Jackett container restart. Indexer configurations are stored separately under `JACKETT_CONFIG_DIR` and remain persisted.
 
 ### Refresh the VPNGate endpoint and recreate the VPN/transmission stack
 

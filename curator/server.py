@@ -15,6 +15,7 @@ import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+import urllib.request
 from uuid import uuid4
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
@@ -30,6 +31,7 @@ from .client import (
     format_percent_done,
     format_size,
     load_api_key,
+    load_flaresolverr_url,
     search_indexers,
 )
 from .config import CuratorConfig, MediaTypeConfig, load_config
@@ -153,7 +155,6 @@ class JobStore:
 class CuratorService:
     def __init__(self, config: CuratorConfig):
         self.config = config
-        self.api_key: str | None = None
         self.jackett_indexers: dict[str, JackettIndexer] = {}
         self.indexer_report_lines: list[str] = []
         self.indexer_failure_count = 0
@@ -162,9 +163,8 @@ class CuratorService:
         self.indexer_error = ""
 
     def jackett_api_key(self) -> str:
-        if self.api_key is None:
-            self.api_key = load_api_key(self.config.jackett_config_dir)
-        return self.api_key
+        # Jackett regenerates this key whenever its stateless server config resets.
+        return load_api_key(self.config.jackett_config_dir)
 
     def config_snapshot(self) -> dict[str, Any]:
         return {
@@ -256,6 +256,7 @@ class CuratorService:
             result,
             self.config.transmission_jackett_base_url,
             self.config.jackett_base_url,
+            self.jackett_api_key(),
             self.config.timeout,
         )
         arguments["labels"] = [f"{CURATOR_MEDIA_LABEL_PREFIX}{media_key}"]
@@ -713,7 +714,6 @@ def watch_config_file(service: CuratorService, interval: int = 10) -> None:
             continue
         current_digest = next_digest
         service.config = next_config
-        service.api_key = None
         service.jackett_indexers = {}
         LOGGER.info("Config reloaded from %s", config_path)
         try:
@@ -838,6 +838,7 @@ def system_overview(service: CuratorService, torrents: list[dict], torrent_error
         "downloads": disk_usage_view("Downloads", service.config.downloads_root),
         "library": disk_usage_view("Library", service.config.library_root),
         "jackett": jackett_status(service),
+        "flaresolverr": flaresolverr_status(service),
         "transmission": transmission_status(torrents, torrent_error),
         "gluetun": gluetun_status(service.config.gluetun_state_path),
     }
@@ -862,6 +863,37 @@ def disk_usage_view(label: str, path: Path) -> dict[str, str]:
 def jackett_status(service: CuratorService) -> dict[str, str]:
     summary = service.indexer_summary()
     return {"state": summary["state"], "summary": summary["message"]}
+
+
+def flaresolverr_status(service: CuratorService) -> dict[str, str]:
+    try:
+        base_url = load_flaresolverr_url(service.config.jackett_config_dir)
+    except Exception as error:
+        return {"state": "warning", "summary": f"Not configured: {error}"}
+
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/",
+        headers={"User-Agent": "private-torrent-downloader/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=min(service.config.timeout, 3.0),
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        return {
+            "state": "warning",
+            "summary": f"Unavailable: {error}",
+        }
+
+    message = str(data.get("msg") or "Unexpected response")
+    version = str(data.get("version") or "unknown version")
+    ready = message == "FlareSolverr is ready!"
+    return {
+        "state": "ready" if ready else "warning",
+        "summary": f"Ready · v{version}" if ready else message,
+    }
 
 
 def transmission_status(torrents: list[dict], torrent_error: str = "") -> dict[str, str]:

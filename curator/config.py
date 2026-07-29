@@ -14,7 +14,7 @@ DEFAULT_JACKETT_CONFIG_DIR = Path("../jackett-config/Jackett")
 DEFAULT_GLUETUN_STATE_PATH = Path("../gluetun/vpngate-state.json")
 DEFAULT_SORT = "seeders"
 DEFAULT_MEDIA_TYPE = "movies"
-DEFAULT_TIMEOUT = 20.0
+DEFAULT_TIMEOUT = 70.0
 
 
 @dataclass(frozen=True)

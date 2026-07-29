@@ -24,6 +24,34 @@ services:
       - ${JACKETT_CONFIG_DIR:-./jackett-config}:/config
     ports:
       - 9117:9117
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /config/Jackett
+        cat >/config/Jackett/ServerConfig.json <<'EOF'
+        {
+          "FlareSolverrUrl": "http://flaresolverr:8191",
+          "FlareSolverrMaxTimeout": 55000
+        }
+        EOF
+        chown "${APP_UID:-1000}:${APP_GID:-1000}" /config/Jackett/ServerConfig.json
+        chmod 0600 /config/Jackett/ServerConfig.json
+        exec /init
+    depends_on:
+      flaresolverr:
+        condition: service_started
+    restart: always
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+      - TZ=${TZ:-America/New_York}
     restart: always
 
   curator:
